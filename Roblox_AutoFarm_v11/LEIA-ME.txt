@@ -1,10 +1,10 @@
-ROBLOX AUTOFARM V11 — AJUSTES NA INTERFACE
+GPO_AutoFarm_v11 — AJUSTES NA INTERFACE
 ==========================================
 
 Somente a interface foi ajustada. Motor de gravações, OCR, relógio e regras
 para comprar permanecem iguais aos da v11 anterior.
 
-1. Janela com título "Roblox AutoFarm v11".
+1. Janela com título "GPO_AutoFarm_v11".
 2. Aba Automação: linhas das gravações mais compactas e monitoramento visível.
    Em telas/janelas menores, use a rolagem para acessar todas as informações.
 3. Campos de gravação SOMENTE LEITURA: escolha um .rec em Selecionar,

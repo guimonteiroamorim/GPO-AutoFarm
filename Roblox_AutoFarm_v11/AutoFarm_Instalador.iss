@@ -1,21 +1,21 @@
 ; Instala o aplicativo compilado pelo PyInstaller em modo --onedir.
 ; Coloque este arquivo na mesma pasta que main.py.
 [Setup]
-AppId=RobloxAutoFarm
-AppName=Roblox AutoFarm
+AppId=GPO_AutoFarm_v11
+AppName=GPO_AutoFarm_v11
 AppVersion=11.0
-AppVerName=Roblox AutoFarm v11
-DefaultDirName={localappdata}\Programs\RobloxAutoFarm
-DefaultGroupName=Roblox AutoFarm
+AppVerName=GPO_AutoFarm_v11
+DefaultDirName={localappdata}\Programs\GPO_AutoFarm_v11
+DefaultGroupName=GPO_AutoFarm_v11
 PrivilegesRequired=lowest
 WizardStyle=modern
 DisableWelcomePage=no
 LicenseFile=TERMOS.txt
 OutputDir=instalador
-OutputBaseFilename=Roblox_AutoFarm_v11_Setup
+OutputBaseFilename=GPO_AutoFarm_v11_Setup
 Compression=lzma
 SolidCompression=yes
-UninstallDisplayIcon={app}\RobloxAutoFarm.exe
+UninstallDisplayIcon={app}\GPO_AutoFarm_v11.exe
 
 [Languages]
 Name: "brazilianportuguese"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
@@ -24,11 +24,11 @@ Name: "brazilianportuguese"; MessagesFile: "compiler:Languages\BrazilianPortugue
 Name: "desktopicon"; Description: "Criar um atalho na area de trabalho"; GroupDescription: "Atalhos:"; Flags: unchecked
 
 [Files]
-Source: "dist\RobloxAutoFarm\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\GPO_AutoFarm_v11\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\Roblox AutoFarm"; Filename: "{app}\RobloxAutoFarm.exe"
-Name: "{autodesktop}\Roblox AutoFarm"; Filename: "{app}\RobloxAutoFarm.exe"; Tasks: desktopicon
+Name: "{autoprograms}\GPO_AutoFarm_v11"; Filename: "{app}\GPO_AutoFarm_v11.exe"
+Name: "{autodesktop}\GPO_AutoFarm_v11"; Filename: "{app}\GPO_AutoFarm_v11.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\RobloxAutoFarm.exe"; Description: "Abrir Roblox AutoFarm"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\GPO_AutoFarm_v11.exe"; Description: "Abrir GPO_AutoFarm_v11"; Flags: nowait postinstall skipifsilent

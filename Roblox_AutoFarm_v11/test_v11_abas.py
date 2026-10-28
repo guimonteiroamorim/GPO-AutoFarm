@@ -17,7 +17,7 @@ class TestarInterfaceV11(unittest.TestCase):
         for label in ('  Automação  ', '  Configurações  ', '  Logs  ',
                       '● Gravar agora', '⬇', 'Sincronizar agora',
                       '▶ Iniciar', '■ Parar', 'Testar OCR', 'Calibrar Candies',
-                      'Verificar gravações'):
+        'Verificar gravações', 'Abrir diagnóstico'):
             self.assertIn(label, strings)
         self.assertTrue(any('ESSENCIAL' in s and 'sincronize' in s for s in strings))
         self.assertEqual(sum('tabs.add(' in ast.get_source_segment(source, n) for n in ast.walk(ui) if isinstance(n,ast.Expr)),3)

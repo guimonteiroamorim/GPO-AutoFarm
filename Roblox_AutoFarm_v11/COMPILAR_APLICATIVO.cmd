@@ -1,10 +1,10 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title Compilar Roblox AutoFarm v11 (ambiente isolado)
+title Compilar GPO_AutoFarm_v11 (ambiente isolado)
 
 echo ==========================================
-echo  Compilacao limpa - Roblox AutoFarm v11
+echo  Compilacao limpa - GPO_AutoFarm_v11
 echo ==========================================
 echo.
 
@@ -31,11 +31,11 @@ echo [3/4] Instalando PyInstaller no ambiente isolado...
 if errorlevel 1 goto error
 
 echo [4/4] Compilando executavel enxuto...
-"%PY%" -m PyInstaller --noconfirm --clean --onedir --windowed --noupx --name RobloxAutoFarm --collect-submodules pynput --exclude-module pandas --exclude-module pyarrow --exclude-module numpy --exclude-module scipy --exclude-module matplotlib --exclude-module cv2 --add-data "gravacoes;gravacoes" --add-data "referencias;referencias" main.py
+"%PY%" -m PyInstaller --noconfirm --clean --onedir --windowed --noupx --name GPO_AutoFarm_v11 --collect-submodules pynput --exclude-module pandas --exclude-module pyarrow --exclude-module numpy --exclude-module scipy --exclude-module matplotlib --exclude-module cv2 --add-data "gravacoes;gravacoes" --add-data "referencias;referencias" main.py
 if errorlevel 1 goto error
 
 echo.
-echo SUCESSO! Abra dist\RobloxAutoFarm\RobloxAutoFarm.exe para testar.
+echo SUCESSO! Abra dist\GPO_AutoFarm_v11\GPO_AutoFarm_v11.exe para testar.
 echo Depois compile AutoFarm_Instalador.iss no Inno Setup.
 echo ATENCAO: Tesseract OCR e externo, e o Windows pode bloquear EXEs nao assinados.
 pause

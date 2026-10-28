@@ -7,7 +7,7 @@ where python >nul 2>&1
 if errorlevel 1 goto no_python
 set "PYTHON=python"
 :found
-echo Instalando bibliotecas do Roblox AutoFarm v10...
+echo Instalando bibliotecas do GPO_AutoFarm_v11...
 "%PYTHON%" -m pip install -r requirements.txt
 if errorlevel 1 (
  echo.

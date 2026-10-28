@@ -1,17 +1,19 @@
 """Controlador das gravações originais TinyTask (.rec). Windows / Python 3.10+."""
 import json
+import math
 import queue
 import re
 import sys
 import threading
 import time
 from collections import Counter
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from PIL import ImageGrab, ImageOps, ImageEnhance, ImageTk
+from PIL import ImageGrab, ImageOps, ImageEnhance, ImageTk, ImageDraw, ImageStat
 import shutil
 import os
 import pytesseract
@@ -29,9 +31,16 @@ from seguranca_candies import avaliar_leituras
 
 BUNDLE_ROOT = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 ROOT = Path(__file__).resolve().parent
-USER_DATA = Path(os.environ.get('LOCALAPPDATA', str(ROOT))) / 'RobloxAutoFarm' if getattr(sys, 'frozen', False) else ROOT
+FROZEN = getattr(sys, 'frozen', False)
+LOCAL_APP_DATA = Path(os.environ.get('LOCALAPPDATA', str(ROOT)))
+LEGACY_USER_DATA = LOCAL_APP_DATA / 'RobloxAutoFarm'
+USER_DATA = LOCAL_APP_DATA / 'GPO_AutoFarm_v11' if FROZEN else ROOT
 USER_DATA.mkdir(parents=True, exist_ok=True)
 CFG = USER_DATA / 'config.json'
+LEGACY_CFG = LEGACY_USER_DATA / 'config.json'
+# Preserve settings when upgrading from the previous EXE installation.
+if FROZEN and not CFG.exists() and LEGACY_CFG.is_file():
+    shutil.copy2(LEGACY_CFG, CFG)
 DEFAULT = {
     'coleta': 'gravacoes/gravacao_coleta_1.rec',
     'analise': 'gravacoes/gravacao_analise_2.rec',
@@ -57,11 +66,12 @@ DEBUG = USER_DATA / 'diagnostico'
 def region_from(cfg, kind):
     result = cfg.get(kind+'_roi', ROIS[kind]) if cfg else ROIS[kind]
     if (not isinstance(result, (list, tuple)) or len(result) != 4 or
-            not all(isinstance(v, (int, float)) for v in result)):
-        return ROIS[kind]
+            not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and math.isfinite(v) for v in result)):
+        raise ValueError(f'Região {kind} inválida: use quatro coordenadas numéricas.')
     x1, y1, x2, y2 = result
     if not (0 <= x1 < x2 <= 1365 and 0 <= y1 < y2 <= 700):
-        return ROIS[kind]
+        raise ValueError(f'Região {kind} fora da área cliente: {result}. Recalibre-a visualmente.')
     return result
 
 def load():
@@ -107,10 +117,25 @@ def macro_recording(path):
         raise ValueError('Selecione a gravação original .rec. Os .exe compilados são bloqueados pelo Windows.')
     return p
 
-def roi(img, region):
+def roi_box(img, region):
     w, h = img.size
+    if w <= 0 or h <= 0:
+        raise ValueError('A captura do Roblox está vazia.')
+    if (not isinstance(region, (list, tuple)) or len(region) != 4 or
+            not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and math.isfinite(v) for v in region)):
+        raise ValueError('Região OCR inválida: são necessárias quatro coordenadas numéricas.')
     x1, y1, x2, y2 = region
+    if not (0 <= x1 < x2 <= 1365 and 0 <= y1 < y2 <= 700):
+        raise ValueError(f'Região OCR fora da área cliente: {region}. Recalibre-a visualmente.')
     box = (round(x1*w/1365), round(y1*h/700), round(x2*w/1365), round(y2*h/700))
+    if box[2] <= box[0] or box[3] <= box[1]:
+        raise ValueError(f'Região OCR pequena demais para a captura {w}x{h}: {box}.')
+    return box
+
+
+def roi(img, region):
+    box = roi_box(img, region)
     return img.crop(box)
 
 def roblox_client_bbox():
@@ -211,7 +236,14 @@ def roblox_em_primeiro_plano():
 
 def screenshot():
     """Captura SOMENTE a área útil do jogo, com título/tarefa excluídos."""
-    return ImageGrab.grab(bbox=roblox_client_bbox(), all_screens=True)
+    return screenshot_with_bbox()[0]
+
+
+def screenshot_with_bbox():
+    if not roblox_em_primeiro_plano():
+        raise RuntimeError('Roblox não está em primeiro plano; captura OCR cancelada.')
+    bbox = roblox_client_bbox()
+    return ImageGrab.grab(bbox=bbox, all_screens=True), bbox
 
 
 def prepared_images(pil, kind):
@@ -225,29 +257,202 @@ def prepared_images(pil, kind):
     return [gray, ImageOps.invert(gray)]
 
 
-def read_candies(screenshot_image, region=None, return_candidates=False):
-    crop = roi(screenshot_image, region or ROIS['candies'])
-    guesses = []
-    for variant in prepared_images(crop, 'candies'):
+@dataclass(frozen=True)
+class CandiesOCRResult:
+    value: int | None
+    candidates: tuple[int, ...]
+    raw_texts: tuple[str, ...]
+    reason: str
+    crop_box: tuple[int, int, int, int] | None
+    prepared: Image.Image | None
+    error: str | None = None
+
+
+def analyze_candies(screenshot_image, region=None, *, tesseract_error=None):
+    region = region or ROIS['candies']
+    try:
+        crop_box = roi_box(screenshot_image, region)
+    except ValueError as exc:
+        return CandiesOCRResult(None, (), (), 'invalid_region', None, None, str(exc))
+
+    crop = screenshot_image.crop(crop_box)
+    if crop.width < 16 or crop.height < 8:
+        return CandiesOCRResult(
+            None, (), (), 'invalid_region', crop_box, None,
+            f'Recorte insuficiente para OCR: {crop.width}x{crop.height}.'
+        )
+
+    variants = prepared_images(crop, 'candies')
+    prepared = variants[0]
+    if tesseract_error:
+        return CandiesOCRResult(
+            None, (), (), 'tesseract_unavailable', crop_box, prepared, tesseract_error
+        )
+
+    raw_texts = []
+    candidates = []
+    for variant in variants:
         try:
             raw = pytesseract.image_to_string(
                 variant,
                 config='--psm 7 -c tessedit_char_whitelist=0123456789/',
                 timeout=2.5,
             )
-        except RuntimeError:
-            continue
-        match = re.search(r'(\d{1,3})\s*/\s*500', raw)
-        if match:
+        except pytesseract.pytesseract.TesseractNotFoundError as exc:
+            return CandiesOCRResult(
+                None, tuple(candidates), tuple(raw_texts), 'tesseract_unavailable',
+                crop_box, prepared, str(exc)
+            )
+        except OSError as exc:
+            return CandiesOCRResult(
+                None, tuple(candidates), tuple(raw_texts), 'tesseract_unavailable',
+                crop_box, prepared, str(exc)
+            )
+        except RuntimeError as exc:
+            return CandiesOCRResult(
+                None, tuple(candidates), tuple(raw_texts), 'ocr_error',
+                crop_box, prepared, str(exc)
+            )
+        raw_texts.append(raw.strip())
+        for match in re.finditer(r'(?<!\d)(\d{1,3})\s*/\s*500', raw):
             number = int(match.group(1))
             if 0 <= number <= 500:
-                guesses.append(number)
-    # Duas interpretações da MESMA imagem devem concordar.
-    # Na v8 bastava uma delas, o que podia transformar 27 em 277.
-    valor = guesses[0] if len(guesses) == 2 and guesses[0] == guesses[1] else None
+                candidates.append(number)
+
+    distinct = set(candidates)
+    if len(distinct) == 1:
+        value = distinct.pop()
+        return CandiesOCRResult(
+            value, tuple(candidates), tuple(raw_texts), 'recognized', crop_box, prepared
+        )
+    if len(distinct) > 1:
+        return CandiesOCRResult(
+            None, tuple(candidates), tuple(raw_texts), 'divergent', crop_box, prepared,
+            f'Variantes OCR divergentes: {sorted(distinct)}.'
+        )
+
+    gray = ImageOps.grayscale(crop)
+    extrema = gray.getextrema()
+    stddev = ImageStat.Stat(gray).stddev[0]
+    reason = 'not_visible' if extrema[1] - extrema[0] < 18 or stddev < 4 else 'unrecognized'
+    return CandiesOCRResult(None, (), tuple(raw_texts), reason, crop_box, prepared)
+
+
+def read_candies(screenshot_image, region=None, return_candidates=False):
+    result = analyze_candies(screenshot_image, region)
     if return_candidates:
-        return valor, tuple(guesses)
-    return valor
+        return result.value, result.candidates
+    return result.value
+
+
+OCR_REASON_LABELS = {
+    'recognized': 'OCR reconhecido',
+    'not_visible': 'Contador não visível',
+    'invalid_region': 'Região de captura inválida',
+    'unrecognized': 'Texto não reconhecido',
+    'tesseract_unavailable': 'Tesseract indisponível',
+    'divergent': 'OCR reconhecido, mas rejeitado por divergência',
+    'capture_failed': 'Falha inesperada de captura',
+    'ocr_error': 'Falha inesperada do OCR',
+}
+
+
+def save_candies_diagnostic(shot, cfg, result=None, *, reason=None, error=None,
+                            client_bbox=None):
+    """Guarda uma amostra completa para diagnóstico visual do contador."""
+    DEBUG.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime('%Y%m%d_%H%M%S') + f'_{time.time_ns() % 1_000_000_000:09d}'
+    folder = DEBUG / f'candies_{stamp}'
+    folder.mkdir()
+    region = None
+    region_error = None
+    try:
+        region = region_from(cfg, 'candies')
+    except ValueError as exc:
+        region_error = str(exc)
+    selected_reason = reason or (result.reason if result else 'capture_failed')
+    crop_box = result.crop_box if result else None
+    dpi_scale = 'indisponível'
+    crop_screen_box = None
+
+    if shot is not None:
+        if client_bbox is None:
+            client_bbox = roblox_client_bbox()
+        shot.save(folder / 'area_cliente.png')
+        if region is not None:
+            crop_box = roi_box(shot, region)
+            crop = shot.crop(crop_box)
+            scale_x = (client_bbox[2] - client_bbox[0]) / shot.width
+            scale_y = (client_bbox[3] - client_bbox[1]) / shot.height
+            crop_screen_box = (
+                client_bbox[0] + round(crop_box[0] * scale_x),
+                client_bbox[1] + round(crop_box[1] * scale_y),
+                client_bbox[0] + round(crop_box[2] * scale_x),
+                client_bbox[1] + round(crop_box[3] * scale_y),
+            )
+            crop.save(folder / 'recorte_candies.png')
+            prepared = result.prepared if result and result.prepared else prepared_images(crop, 'candies')[0]
+            prepared.save(folder / 'preparada_tesseract.png')
+            annotated = shot.copy()
+            ImageDraw.Draw(annotated).rectangle(
+                (crop_box[0], crop_box[1], crop_box[2] - 1, crop_box[3] - 1),
+                outline=(255, 0, 0), width=max(2, round(shot.width / 700))
+            )
+            annotated.save(folder / 'regiao_analisada.png')
+        if client_bbox:
+            user32 = ctypes.WinDLL('user32', use_last_error=True)
+            user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+            user32.FindWindowW.restype = wintypes.HWND
+            hwnd = user32.FindWindowW(None, 'Roblox')
+            get_dpi = getattr(user32, 'GetDpiForWindow', None)
+            if hwnd and get_dpi:
+                get_dpi.argtypes = [wintypes.HWND]
+                get_dpi.restype = wintypes.UINT
+                dpi_scale = f'{get_dpi(hwnd) / 96:.2f}x'
+
+    raw_texts = result.raw_texts if result else ()
+    candidates = result.candidates if result else ()
+    value = result.value if result else None
+    lines = [
+        f'Horário local: {time.strftime("%Y-%m-%d %H:%M:%S")}',
+        f'Resultado: {OCR_REASON_LABELS.get(selected_reason, selected_reason)}',
+        f'Valor reconhecido: {value if value is not None else "nenhum"}',
+        f'Variantes numéricas válidas: {list(candidates)}',
+        f'OCR bruto por variante: {list(raw_texts)!r}',
+        f'Motivo/erro: {error or (result.error if result else None) or region_error or "nenhum"}',
+        f'Resolução da captura: {f"{shot.width}x{shot.height}" if shot else "indisponível"}',
+        f'Retângulo cliente na tela: {client_bbox or "indisponível"}',
+        f'Recorte em coordenadas da tela: {crop_screen_box or "indisponível"}',
+        f'Escala DPI da janela: {dpi_scale}',
+        f'Região normalizada (área cliente 1365x700): {region or "inválida"}',
+        f'Recorte em pixels (imagem capturada): {crop_box or "indisponível"}',
+        f'Executável Tesseract: {pytesseract.pytesseract.tesseract_cmd}',
+    ]
+    (folder / 'diagnostico.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    prune_candies_diagnostics()
+    return folder
+
+
+def prune_candies_diagnostics():
+    if not DEBUG.is_dir():
+        return
+    folders = sorted(
+        (path for path in DEBUG.glob('candies_*') if path.is_dir()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for old in folders[10:]:
+        for child in old.iterdir():
+            if child.is_file():
+                child.unlink()
+        old.rmdir()
+    audits = sorted(
+        DEBUG.glob('*_compra_*_contador.png'),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for old in audits[20:]:
+        old.unlink()
 
 
 def parse_clock_text(raw):
@@ -330,6 +535,38 @@ def locate_tesseract():
     ]
     return next((p for p in candidates if p and Path(p).is_file()), None)
 
+
+def configure_tesseract(cfg):
+    configured = str(cfg.get('tesseract', '') or '').strip()
+    discovered = locate_tesseract()
+    candidates = []
+    if configured and Path(configured).is_file():
+        candidates.append(configured)
+    if discovered and discovered not in candidates:
+        candidates.append(discovered)
+    if not candidates:
+        pytesseract.pytesseract.tesseract_cmd = 'tesseract'
+        raise RuntimeError(
+            'Tesseract OCR não encontrado. Instale o Tesseract ou configure o caminho '
+            'do tesseract.exe em config.json.'
+        )
+
+    errors = []
+    for engine in candidates:
+        pytesseract.pytesseract.tesseract_cmd = str(engine)
+        try:
+            version = pytesseract.get_tesseract_version()
+        except (pytesseract.pytesseract.TesseractNotFoundError, OSError, RuntimeError) as exc:
+            errors.append(f'{engine}: {exc}')
+            continue
+        warning = None
+        if configured and engine != configured:
+            warning = f'O caminho Tesseract salvo não está disponível; usando a instalação encontrada em {engine}.'
+        return str(engine), str(version), warning
+
+    raise RuntimeError('Tesseract encontrado, mas não pôde ser executado: ' + '; '.join(errors))
+
+
 def boss_status(server_seconds):
     # Primeiro boss: 25:00–34:59. Depois: 60:00–69:59, etc.
     if server_seconds < 25*60:
@@ -366,10 +603,10 @@ class Controller:
                     raise FileNotFoundError(f'Não encontrei {rec.name}. Selecione a gravação .rec no aplicativo.')
                 read_rec(rec)
             self.cfg = cfg.copy()
-            engine = cfg.get('tesseract') or locate_tesseract()
-            if not engine or not Path(engine).is_file():
-                raise RuntimeError('Tesseract OCR não encontrado. Instale o Tesseract ou configure seu caminho em config.json antes de iniciar.')
-            pytesseract.pytesseract.tesseract_cmd = str(engine)
+            engine, version, warning = configure_tesseract(cfg)
+            if warning:
+                self.emit('log', warning)
+            self.emit('log', f'Tesseract confirmado: {engine} (versão {version}).')
             self.stop.clear()
             self.thread = threading.Thread(target=self.loop, daemon=True)
             self.thread.start()
@@ -411,13 +648,14 @@ class Controller:
         hard_deadline = end_at + 90
         readings = []  # (instante da captura, valor) desta análise APENAS
         interpretacoes_brutas = []  # TODAS as variantes OCR, inclusive contraditórias
-        failed_samples = []
+        diagnostic_samples = []
+        sampled_reasons = set()
+        failure_counts = Counter()
         latest_valid_shot = [None]
         audit_by_value = {}
         ocr_attempts = [0]
         ocr_finished = threading.Event()
         ocr_thread = None
-        failure = []
 
         def inspect_while_equipped():
             # A gravação 2 equipa o item logo no começo e desequipa no fim.
@@ -435,24 +673,59 @@ class Controller:
                         ocr_finished.wait(min(delay, 0.1))
                         continue
                     ocr_attempts[0] += 1
+                    shot = None
+                    capture_bbox = None
+                    result = None
+                    candy_region = None
                     try:
-                        shot = screenshot()
-                        value, candidatos = read_candies(shot, region_from(self.cfg, 'candies'), return_candidates=True)
-                        interpretacoes_brutas.extend(candidatos)
+                        shot, capture_bbox = screenshot_with_bbox()
+                        try:
+                            candy_region = region_from(self.cfg, 'candies')
+                        except ValueError as exc:
+                            result = CandiesOCRResult(
+                                None, (), (), 'invalid_region', None, None, str(exc)
+                            )
+                        else:
+                            try:
+                                result = analyze_candies(shot, candy_region)
+                            except Exception as exc:
+                                result = CandiesOCRResult(
+                                    None, (), (), 'ocr_error', None, None, str(exc)
+                                )
+                        interpretacoes_brutas.extend(result.candidates)
+                        value = result.value
                         if value is not None:
                             readings.append((time.monotonic(), value))
                             latest_valid_shot[0] = shot
                             if value not in audit_by_value and len(audit_by_value) < 5:
-                                audit_by_value[value] = shot.copy()
+                                audit_by_value[value] = (
+                                    shot.copy(), result, candy_region, capture_bbox
+                                )
                             self.emit('candies', str(value))
                             if len(readings) == 1:
                                 self.emit('log', f'Candies detectados durante a análise: {value}. Aguardando o fim da gravação.')
-                        elif len(failed_samples) < 4 and (not failed_samples or now - failed_samples[-1][0] >= 8):
-                            failed_samples.append((now,shot))
+                        else:
+                            failure_counts[result.reason] += 1
+                            if result.reason not in sampled_reasons and len(diagnostic_samples) < 2:
+                                sampled_reasons.add(result.reason)
+                                diagnostic_samples.append((
+                                    shot, result, result.reason, result.error,
+                                    capture_bbox, candy_region
+                                ))
+                            if result.reason in ('invalid_region', 'tesseract_unavailable'):
+                                break
                     except Exception as exc:
-                        # Erros temporários de OCR não interrompem os movimentos.
-                        if len(failure) < 3:
-                            failure.append(str(exc))
+                        reason = 'capture_failed' if shot is None else 'ocr_error'
+                        failure_counts[reason] += 1
+                        if reason not in sampled_reasons and len(diagnostic_samples) < 2:
+                            sampled_reasons.add(reason)
+                            diagnostic_samples.append((
+                                shot,
+                                CandiesOCRResult(
+                                    None, (), (), reason, None, None, str(exc)
+                                ) if shot is not None else None,
+                                reason, str(exc), capture_bbox, candy_region
+                            ))
                     next_read = time.monotonic() + max(0.7, float(self.cfg['intervalo_ocr']))
             finally:
                 ocr_finished.set()
@@ -518,38 +791,58 @@ class Controller:
         if ocr_thread and ocr_thread.is_alive():
             self.emit('log','OCR não terminou a tempo: compra bloqueada.')
             return None
-        if failure:
-            self.emit('log', 'Aviso de OCR: ' + failure[-1])
         veredito = avaliar_leituras(readings, time.monotonic(), meta=int(self.cfg['meta']),
                                      interpretacoes_brutas=interpretacoes_brutas)
         self.emit('log', f'Análise completa: {ocr_attempts[0]} tentativas OCR; '
                          f'{veredito.total} leituras válidas; {veredito.motivo}')
+        for reason, count in failure_counts.items():
+            label = OCR_REASON_LABELS.get(reason, reason)
+            self.emit('log', f'OCR Candies: {label} ({count} tentativa(s)).')
+
+        selected_diagnostics = []
+        if not veredito.confiavel_para_compra and (
+                len(veredito.distintos) > 1 or 'contradizem' in veredito.motivo):
+            self.emit('log', f'OCR Candies: {OCR_REASON_LABELS["divergent"]}. '
+                             f'{veredito.motivo}')
+            for value in veredito.distintos:
+                audit = audit_by_value.get(value)
+                if audit and len(selected_diagnostics) < 2:
+                    shot, result, candy_region, capture_bbox = audit
+                    selected_diagnostics.append((
+                        shot, result, 'divergent', veredito.motivo,
+                        capture_bbox, candy_region
+                    ))
+        for sample in diagnostic_samples:
+            if len(selected_diagnostics) >= 2:
+                break
+            selected_diagnostics.append(sample)
+
+        diagnostic_paths = []
+        for shot, result, reason, error, capture_bbox, _ in selected_diagnostics[:2]:
+            try:
+                diagnostic_paths.append(save_candies_diagnostic(
+                    shot, self.cfg, result, reason=reason, error=error,
+                    client_bbox=capture_bbox
+                ))
+            except Exception as exc:
+                self.emit('log', f'Não consegui salvar o diagnóstico OCR: {exc}')
+        if diagnostic_paths:
+            self.emit('log', f'Diagnóstico visual do OCR salvo em {DEBUG}.')
+
         # Auditoria local: guardar o recorte real que precedeu a decisão.
         # Não salva a tela inteira normalmente, para reduzir exposição de informações.
-        DEBUG.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime('%Y%m%d_%H%M%S')
         if latest_valid_shot[0] is not None:
             try:
+                DEBUG.mkdir(parents=True, exist_ok=True)
                 nome = 'compra_autorizada' if veredito.confiavel_para_compra else 'compra_bloqueada'
                 roi(latest_valid_shot[0], region_from(self.cfg, 'candies')).save(
                     DEBUG / f'{stamp}_{nome}_contador.png')
+                prune_candies_diagnostics()
             except Exception as e:
                 self.emit('log', f'Não consegui salvar imagem de auditoria: {e}')
         if len(veredito.distintos) > 1:
-            for valor, img in audit_by_value.items():
-                try:
-                    roi(img, region_from(self.cfg, 'candies')).save(
-                        DEBUG / f'{stamp}_leitura_divergente_{valor}.png')
-                except Exception:
-                    pass
-            self.emit('log', f'Imagens das leituras divergentes salvas em {DEBUG}.')
-        if not veredito.confiavel_para_compra and failed_samples:
-            for i, (_, img) in enumerate(failed_samples[:2]):
-                try:
-                    roi(img, region_from(self.cfg, 'candies')).save(
-                        DEBUG / f'{stamp}_amostra_invalida_{i+1}.png')
-                except Exception:
-                    pass
+            self.emit('log', f'Leituras contraditórias bloqueadas; amostras salvas em {DEBUG}.')
         return veredito
 
     def clock(self):
@@ -660,7 +953,7 @@ class Controller:
 class App:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title('Roblox AutoFarm v11')
+        self.root.title('GPO_AutoFarm_v11')
         self.root.geometry('910x675')
         self.root.minsize(790,520)
         self.data = load()
@@ -699,7 +992,7 @@ class App:
         """Layout em abas. Mantém os mesmos comandos e variáveis da v10."""
         pad = ttk.Frame(self.root, padding=14)
         pad.pack(fill='both', expand=True)
-        ttk.Label(pad, text='Roblox AutoFarm',
+        ttk.Label(pad, text='GPO_AutoFarm_v11',
                   font=('Segoe UI', 17, 'bold')).pack(anchor='w')
         ttk.Label(pad, text='TinyTask .rec + OCR Candies • relógio sincronizado manualmente').pack(
             anchor='w', pady=(0, 10))
@@ -791,6 +1084,8 @@ class App:
             side='left', fill='x', expand=True, padx=6)
         ttk.Button(actions, text='Verificar gravações', command=self.inspect_macros).pack(
             side='left', fill='x', expand=True)
+        ttk.Button(actions, text='Abrir diagnóstico', command=self.open_diagnostics).pack(
+            side='left', fill='x', expand=True, padx=(6, 0))
 
         # ABA CONFIGURAÇÕES: apenas teclas; nenhum outro parâmetro de execução.
         keys = ttk.LabelFrame(configs, text='Atalhos de teclado', padding=16)
@@ -935,6 +1230,7 @@ class App:
 
     def _capture_calibration(self, kind):
         try:
+            activate_roblox_window()
             shot = screenshot()
         except Exception as e:
             self.root.deiconify()
@@ -983,6 +1279,13 @@ class App:
         canvas.bind('<ButtonRelease-1>',up)
         ttk.Button(win,text='Cancelar',command=win.destroy).pack(pady=(0,8))
 
+    def open_diagnostics(self):
+        try:
+            DEBUG.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(DEBUG))
+        except (AttributeError, OSError) as exc:
+            messagebox.showerror('Diagnóstico indisponível', str(exc))
+
     def test_ocr(self):
         if self.controller.active():
             messagebox.showwarning('Automação ativa', 'Pare a automação antes de testar o OCR.')
@@ -990,22 +1293,69 @@ class App:
         # Ocultar a janela do próprio AutoFarm: ela cobre parte dos Candies.
         self.root.withdraw()
         def task():
+            result_message = ''
+            shot = None
+            capture_bbox = None
             try:
                 time.sleep(0.65)
-                engine = self.data.get('tesseract') or locate_tesseract()
-                if not engine:
-                    raise RuntimeError('Tesseract OCR não encontrado. Instale-o ou indique o caminho no config.json.')
-                pytesseract.pytesseract.tesseract_cmd = str(engine)
-                shot = screenshot()
+                activate_roblox_window()
+                shot, capture_bbox = screenshot_with_bbox()
                 self.events.put(('log', f'Área interna do Roblox: {shot.width}x{shot.height} px (sem barra de título/tarefas).'))
-                candies = read_candies(shot, region_from(self.data,'candies'))
-                if candies is not None:
-                    self.events.put(('candies',str(candies)))
-                self.events.put(('log',f'Teste OCR dos Candies: {candies if candies is not None else "NÃO identificado"}. O relógio é manual (sem OCR).'))
+                try:
+                    candy_region = region_from(self.data, 'candies')
+                except ValueError as exc:
+                    result = CandiesOCRResult(
+                        None, (), (), 'invalid_region', None, None, str(exc)
+                    )
+                else:
+                    try:
+                        engine, version, warning = configure_tesseract(self.data)
+                        if warning:
+                            self.events.put(('log', warning))
+                        self.events.put(('log', f'Tesseract confirmado: {engine} (versão {version}).'))
+                        result = analyze_candies(shot, candy_region)
+                    except RuntimeError as exc:
+                        result = analyze_candies(
+                            shot, candy_region, tesseract_error=str(exc)
+                        )
+                folder = save_candies_diagnostic(
+                    shot, self.data, result, client_bbox=capture_bbox
+                )
+                label = OCR_REASON_LABELS[result.reason]
+                self.events.put(('log', f'Teste OCR: {label}; '
+                                 f'Candies: {result.value if result.value is not None else "não identificado"}; '
+                                 f'diagnóstico salvo em {folder}.'))
+                if result.value is not None:
+                    self.events.put(('candies', str(result.value)))
+                result_message = (
+                    f'{label}\n'
+                    f'Candies: {result.value if result.value is not None else "não identificado"}\n\n'
+                    f'Diagnóstico visual: {folder}'
+                )
             except Exception as e:
-                self.events.put(('error',f'Teste OCR: {e}'))
+                reason = 'capture_failed' if shot is None else 'ocr_error'
+                failure_result = CandiesOCRResult(
+                    None, (), (), reason, None, None, str(e)
+                ) if shot is not None else None
+                try:
+                    folder = save_candies_diagnostic(
+                        shot, self.data, failure_result, reason=reason,
+                        error=str(e), client_bbox=capture_bbox
+                    )
+                    self.events.put(('log', f'OCR Candies: {OCR_REASON_LABELS[reason]}: '
+                                     f'{e}. Diagnóstico salvo em {folder}.'))
+                    result_message = (
+                        f'{OCR_REASON_LABELS[reason]}\n{e}\n\n'
+                        f'Diagnóstico: {folder}'
+                    )
+                except Exception as diagnostic_error:
+                    self.events.put(('log', f'Teste OCR: {e}; falha ao salvar diagnóstico: '
+                                     f'{diagnostic_error}'))
+                    result_message = f'Falha no teste OCR: {e}\nFalha no diagnóstico: {diagnostic_error}'
             finally:
                 self.events.put(('restore_window', None))
+                if result_message:
+                    self.events.put(('ocr_test_result', result_message))
         threading.Thread(target=task,daemon=True).start()
 
     def arm_recording(self, stage):
@@ -1252,6 +1602,8 @@ class App:
                 elif key=='boss':self.boss.set(value)
                 elif key=='clock':self.clock_var.set(value)
                 elif key=='log':self.log(value)
+                elif key=='ocr_test_result':
+                    messagebox.showinfo('Teste OCR dos Candies', value)
                 elif key=='error':
                     self.log('ERRO: '+value)
                     # Exibir o erro somente DEPOIS de restaurar a interface.
@@ -1303,14 +1655,14 @@ if __name__ == '__main__':
         kernel32.CreateMutexW.restype = wintypes.HANDLE
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
-        mutex = kernel32.CreateMutexW(None, False, 'Local\\RobloxAutoFarm_v8_Mutex')
+        mutex = kernel32.CreateMutexW(None, False, 'Local\\GPO_AutoFarm_v11_Mutex')
         if not mutex:
             raise OSError(ctypes.get_last_error(), 'Não foi possível criar o bloqueio de instância.')
         try:
             if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
                 ctypes.windll.user32.MessageBoxW(
-                    None, 'O Roblox AutoFarm já está aberto. Use a janela existente.',
-                    'AutoFarm já em execução', 0x40)
+                    None, 'O GPO_AutoFarm_v11 já está aberto. Use a janela existente.',
+                    'GPO_AutoFarm_v11 já em execução', 0x40)
             else:
                 App().root.mainloop()
         finally:

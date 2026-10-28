@@ -17,8 +17,16 @@ class TestarAjustesUI(unittest.TestCase):
         return next(n for n in self.app.body if isinstance(n, ast.FunctionDef) and n.name == nome)
 
     def test_nome_exato_da_janela(self):
-        self.assertIn("self.root.title('Roblox AutoFarm v11')", self.texto)
+        self.assertIn("self.root.title('GPO_AutoFarm_v11')", self.texto)
         self.assertNotIn('v11 Interface em Abas', self.texto)
+
+    def test_nome_novo_nos_artefatos_de_distribuicao(self):
+        compilador = (BASE / 'COMPILAR_APLICATIVO.cmd').read_text(encoding='utf-8')
+        instalador = (BASE / 'AutoFarm_Instalador.iss').read_text(encoding='utf-8')
+        self.assertIn('--name GPO_AutoFarm_v11', compilador)
+        self.assertIn(r'dist\GPO_AutoFarm_v11\GPO_AutoFarm_v11.exe', compilador)
+        self.assertIn('OutputBaseFilename=GPO_AutoFarm_v11_Setup', instalador)
+        self.assertIn('GPO_AutoFarm_v11.exe', instalador)
 
     def test_tres_campos_readonly(self):
         ui = ast.get_source_segment(self.texto, self.metodo('construct'))
