@@ -1,0 +1,27 @@
+{
+  "coleta": "C:/Users/GUI/Downloads/doce.rec",
+  "analise": "C:/Users/GUI/Downloads/gravacao_analise_2.rec",
+  "compra": "C:/Users/GUI/Downloads/gravacao_compra_3.rec",
+  "hotkey": "f12",
+  "record_hotkey": "f8",
+  "meta": 250,
+  "intervalo_ocr": 0.8,
+  "margem_compra_segundos": 35,
+  "duracao_compra_max_segundos": 45,
+  "duracao_analise_min_segundos": 43,
+  "duracao_analise_max_segundos": 120,
+  "tesseract": "",
+  "candies_roi": [
+    620,
+    554,
+    721,
+    585
+  ],
+  "clock_roi": [
+    1322,
+    648,
+    1365,
+    661
+  ],
+  "roi_coordinate_space": "roblox_client_v2"
+}
