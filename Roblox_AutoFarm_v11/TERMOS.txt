@@ -1,0 +1,12 @@
+TERMOS DE USO - ROBLOX AUTOFARM v11
+
+Este software permite automatizar a reproducao de gravacoes locais e a leitura de informacoes na tela.
+
+1. O usuario e responsavel por configurar e supervisionar as gravacoes e por cumprir as regras dos jogos e plataformas onde utilizar o programa.
+2. A ferramenta nao garante que todas as interacoes, leituras ou compras sejam realizadas corretamente. Teste antes de utilizacao prolongada.
+3. As configuracoes e gravacoes sao armazenadas localmente no computador; confira as permissoes dos arquivos exportados.
+4. O aplicativo e fornecido sem garantia de funcionamento ininterrupto ou compatibilidade com todas as atualizacoes do jogo e do Windows.
+
+Ao aceitar, voce reconhece estas condicoes.
+
+Este documento e um modelo inicial. Revise e adapte os termos conforme as suas necessidades antes de distribuir o software.

@@ -1,0 +1,8 @@
+{
+  "coleta": "gravacoes/gravacao_coleta_1.rec",
+  "analise": "gravacoes/gravacao_analise_2.rec",
+  "compra": "gravacoes/gravacao_compra_3.rec",
+  "hotkey": "f12",
+  "record_hotkey": "f8",
+  "meta": 250
+}

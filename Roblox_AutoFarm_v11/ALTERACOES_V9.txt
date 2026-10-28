@@ -1,0 +1,18 @@
+V9 — CORREÇÃO DO BLOQUEIO DE COMPRA
+
+Motivo: na v8 a maioria das leituras podia ser 277, enquanto outras leituras
+eram 227; esse conflito precisava VETAR a compra, não autorizar.
+
+Regras:
+- Dois preparos da mesma captura precisam coincidir.
+- Leituras de frames diferentes precisam coincidir integralmente.
+- Qualquer resultado discordante, inclusive de uma das variantes, BLOQUEIA.
+- Precisa de 5 leituras em >=4 segundos, última <=12s antes do término.
+- Amostra antiga nunca é aproveitada na análise seguinte.
+- Compra ainda exige meta 250, tempo de boss sincronizado e margem de 80s.
+- Se falhar a análise, o AutoFarm VOLTA À COLETA, não compra.
+- O painel distingue leituras provisórias, confirmadas e não confirmadas.
+- Imagens locais de auditoria em diagnostico.
+
+Mantidos: gravação F8, reprodução até o fim dos 3 .rec, F12, OCR em thread
+separada, relógio manual, interface Tkinter.
