@@ -1,0 +1,24 @@
+# Empacotamento e distribuição (não versionar)
+/build/
+/dist/
+/instalador/
+*.spec
+
+# Ambientes, bibliotecas e cache
+.build-venv/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Dados locais/privados
+/config.json
+/diagnostico/
+*.log
+*.tmp
+
+# Gravações personalizadas geradas com timestamp (preserva as 3 padrão)
+/gravacoes/gravacao_*_20????????_??????.rec
+/gravacoes/gravacao_*_20????????_??????.rec.meta.json
