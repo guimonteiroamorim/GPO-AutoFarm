@@ -37,6 +37,14 @@ def avaliar_leituras(amostras, final_da_analise, meta=250,
         leituras.append((float(instante), int(valor)))
     if not leituras:
         return VereditoCandies(None, False, 'Nenhuma leitura válida nesta análise.', 0, ())
+    instantes_distintos = {instante for instante, _ in leituras}
+    if len(instantes_distintos) < minimo_leituras:
+        return VereditoCandies(
+            None, False,
+            f'Somente {len(instantes_distintos)} instantes distintos; '
+            f'mínimo para compra: {minimo_leituras}.',
+            len(leituras), tuple(sorted({valor for _, valor in leituras})),
+        )
 
     valores = [valor for _, valor in leituras]
     distintos = tuple(sorted(set(valores)))

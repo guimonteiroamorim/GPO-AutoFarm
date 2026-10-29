@@ -1,8 +1,26 @@
-GPO_AutoFarm_v11 — AJUSTES NA INTERFACE
-==========================================
+GPO_AutoFarm_v11 — CORREÇÃO DO OCR DOS CANDIES
+==============================================
 
-Somente a interface foi ajustada. Motor de gravações, OCR, relógio e regras
-para comprar permanecem iguais aos da v11 anterior.
+A captura padrão dos Candies agora cobre a região (580, 535, 790, 610) da
+área cliente do Roblox. O contador é localizado pela aparência laranja e pela
+geometria da barra; somente o numerador é enviado ao Tesseract. Recortes
+parciais ou escalas sem detalhe suficiente ficam inconclusivos.
+
+Testar OCR só fica disponível com automação e gravação paradas. O teste mostra
+a região analisada e o numerador isolado, sem reproduzir entradas ou alterar
+o item equipado. Os diagnósticos ficam em diagnostico/ e incluem imagens do
+contador localizado e do numerador.
+
+As regras de compra seguem conservadoras: mínimo de 250 Candies, pelo menos
+cinco leituras concordantes em instantes distintos, ausência de contradições,
+leitura recente, boss ausente, relógio manual sincronizado e margem suficiente
+antes do spawn. Os arquivos .rec e sua reprodução não foram alterados.
+
+Implementação: main.py (locate_candies_counter, analyze_candies,
+save_candies_diagnostic, App.test_ocr e App._show_ocr_test_result),
+seguranca_candies.py (avaliar_leituras) e seus testes.
+
+--- AJUSTES NA INTERFACE V11 ---
 
 1. Janela com título "GPO_AutoFarm_v11".
 2. Aba Automação: linhas das gravações mais compactas e monitoramento visível.

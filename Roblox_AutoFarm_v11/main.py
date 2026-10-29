@@ -13,7 +13,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from PIL import ImageGrab, ImageOps, ImageEnhance, ImageTk, ImageDraw, ImageStat
+from PIL import ImageGrab, ImageOps, ImageTk, ImageDraw
 import shutil
 import os
 import pytesseract
@@ -54,13 +54,13 @@ DEFAULT = {
     'duracao_analise_min_segundos': 43,
     'duracao_analise_max_segundos': 120,
     'tesseract': '',
-    'candies_roi': [620, 554, 721, 585],
+    'candies_roi': [580, 535, 790, 610],
     'clock_roi': [1322, 648, 1365, 661],
     'roi_coordinate_space': 'roblox_client_v2',
 }
 # Coordenadas relativas APENAS à área interna do jogo Roblox, sem bordas do Windows.
 # Ajustadas com capturas de 1365x700 e 1366x697 (janela 1366x768).
-ROIS = {'candies': (620,554,721,585), 'clock': (1322,648,1365,661)}
+ROIS = {'candies': (580,535,790,610), 'clock': (1322,648,1365,661)}
 DEBUG = USER_DATA / 'diagnostico'
 
 def region_from(cfg, kind):
@@ -89,6 +89,8 @@ def load():
         for key in ('candies','clock'):
             data[key + '_roi'] = list(ROIS[key])
         data['roi_coordinate_space'] = 'roblox_client_v2'
+    if data.get('candies_roi') == [620, 554, 721, 585]:
+        data['candies_roi'] = list(ROIS['candies'])
     # Corrigir a ROI padrão v3 por uma ROI ligeiramente mais alta, sem apagar
     # nenhuma seleção personalizada feita na interface.
     if data.get('clock_roi') == [1322, 649, 1365, 662]:
@@ -266,6 +268,169 @@ class CandiesOCRResult:
     crop_box: tuple[int, int, int, int] | None
     prepared: Image.Image | None
     error: str | None = None
+    counter_box: tuple[int, int, int, int] | None = None
+    numerator_box: tuple[int, int, int, int] | None = None
+
+
+def locate_candies_counter(crop):
+    """Localiza o contador laranja e recorta o numerador antes da barra."""
+    width, height = crop.size
+    if width <= 0 or height <= 0:
+        return 'not_visible', None, None
+
+    pixels = crop.load()
+    mask = bytearray(width * height)
+    row_counts = [0] * height
+    for y in range(height):
+        offset = y * width
+        for x in range(width):
+            red, green, blue = pixels[x, y]
+            if (red > 115 and green > 25 and red > green * 1.25 and
+                    red > blue * 1.35 and red - green > 40):
+                mask[offset + x] = 1
+                row_counts[y] += 1
+
+    row_threshold = max(3, round(width * 0.035))
+    active_rows = [y for y, count in enumerate(row_counts)
+                   if count >= row_threshold]
+    if not active_rows:
+        return 'not_visible', None, None
+
+    runs = []
+    for y in active_rows:
+        if not runs or y > runs[-1][-1] + 2:
+            runs.append([y])
+        else:
+            runs[-1].append(y)
+    line_rows = max(runs, key=lambda run: sum(row_counts[y] for y in run))
+    line_top, line_bottom = line_rows[0], line_rows[-1] + 1
+    line_pixels = [
+        (x, y)
+        for y in range(line_top, line_bottom)
+        for x in range(width)
+        if mask[y * width + x]
+    ]
+    if not line_pixels:
+        return 'not_visible', None, None
+
+    line_box = (
+        min(x for x, _ in line_pixels),
+        line_top,
+        max(x for x, _ in line_pixels) + 1,
+        line_bottom,
+    )
+    scale = width / 210
+    visited = bytearray(width * height)
+    components = []
+    min_area = max(6, round(scale * scale * 8))
+    for y in range(line_top, line_bottom):
+        for x in range(width):
+            index = y * width + x
+            if not mask[index] or visited[index]:
+                continue
+            stack = [(x, y)]
+            visited[index] = 1
+            points = []
+            while stack:
+                px, py = stack.pop()
+                points.append((px, py))
+                for next_y in range(max(line_top, py - 1),
+                                    min(line_bottom, py + 2)):
+                    for next_x in range(max(0, px - 1),
+                                        min(width, px + 2)):
+                        next_index = next_y * width + next_x
+                        if mask[next_index] and not visited[next_index]:
+                            visited[next_index] = 1
+                            stack.append((next_x, next_y))
+            if len(points) < min_area:
+                continue
+            x0 = min(px for px, _ in points)
+            x1 = max(px for px, _ in points) + 1
+            y0 = min(py for _, py in points)
+            y1 = max(py for _, py in points) + 1
+            edge_rows = max(1, round((y1 - y0) * 0.2))
+            top_x = [px for px, py in points if py < y0 + edge_rows]
+            bottom_x = [px for px, py in points if py >= y1 - edge_rows]
+            slope = (
+                sum(bottom_x) / len(bottom_x) - sum(top_x) / len(top_x)
+                if top_x and bottom_x else 0
+            )
+            components.append({
+                'x0': x0, 'x1': x1, 'y0': y0, 'y1': y1,
+                'height': y1 - y0, 'slope': slope,
+            })
+
+    line_height = max((component['height'] for component in components), default=0)
+    edge_margin = max(2, round(scale * 2))
+    if (line_height <= 0 or line_box[0] <= edge_margin or
+            line_box[1] <= edge_margin or
+            line_box[2] >= width - edge_margin or
+            line_box[3] >= height - edge_margin):
+        return 'unrecognized', line_box, None
+
+    separator_candidates = [
+        component for component in components
+        if component['x1'] - component['x0'] <= line_height * 0.65
+        and component['height'] >= line_height * 0.75
+        and abs(component['slope']) >= line_height * 0.23
+    ]
+    layouts = []
+    for separator in separator_candidates:
+        before = [
+            component for component in components
+            if component is not separator and component['x0'] < separator['x0']
+            and component['x1'] <= separator['x0'] + 1
+        ]
+        if not before:
+            continue
+        number_left = min(component['x0'] for component in before)
+        number_width = separator['x0'] - number_left
+        if (number_left <= edge_margin or
+                number_width < line_height * 0.3 or
+                number_width > line_height * 2.5):
+            continue
+
+        after = sorted(
+            (component for component in components
+             if component is not separator
+             and component['x0'] >= separator['x1'] - 1),
+            key=lambda component: component['x0'],
+        )
+        denominator = []
+        for component in after:
+            if denominator and component['x0'] - denominator[-1]['x1'] > line_height * 0.35:
+                break
+            denominator.append(component)
+        if not denominator:
+            continue
+        denominator_width = (
+            max(component['x1'] for component in denominator) -
+            min(component['x0'] for component in denominator)
+        )
+        if not line_height * 1.5 <= denominator_width <= line_height * 2.7:
+            continue
+        number_top = min(component['y0'] for component in before)
+        number_bottom = max(component['y1'] for component in before)
+        layouts.append((
+            separator,
+            number_left,
+            number_width,
+            number_top,
+            number_bottom,
+        ))
+
+    if len(layouts) != 1:
+        return 'unrecognized', line_box, None
+
+    separator, number_left, _, number_top, number_bottom = layouts[0]
+    padding = max(1, round(line_height * 0.18))
+    numerator_box = (
+        max(0, number_left - padding),
+        max(0, number_top - padding),
+        separator['x0'],
+        min(height, number_bottom + padding),
+    )
+    return 'recognized', line_box, numerator_box
 
 
 def analyze_candies(screenshot_image, region=None, *, tesseract_error=None):
@@ -275,47 +440,78 @@ def analyze_candies(screenshot_image, region=None, *, tesseract_error=None):
     except ValueError as exc:
         return CandiesOCRResult(None, (), (), 'invalid_region', None, None, str(exc))
 
-    crop = screenshot_image.crop(crop_box)
+    crop = screenshot_image.crop(crop_box).convert('RGB')
     if crop.width < 16 or crop.height < 8:
         return CandiesOCRResult(
             None, (), (), 'invalid_region', crop_box, None,
             f'Recorte insuficiente para OCR: {crop.width}x{crop.height}.'
         )
 
-    variants = prepared_images(crop, 'candies')
-    prepared = variants[0]
+    visibility, local_counter_box, local_numerator_box = locate_candies_counter(crop)
+    counter_box = (
+        (crop_box[0] + local_counter_box[0],
+         crop_box[1] + local_counter_box[1],
+         crop_box[0] + local_counter_box[2],
+         crop_box[1] + local_counter_box[3])
+        if local_counter_box else None
+    )
+    numerator_box = (
+        (crop_box[0] + local_numerator_box[0],
+         crop_box[1] + local_numerator_box[1],
+         crop_box[0] + local_numerator_box[2],
+         crop_box[1] + local_numerator_box[3])
+        if local_numerator_box else None
+    )
+    if visibility == 'not_visible':
+        return CandiesOCRResult(
+            None, (), (), 'not_visible', crop_box, None,
+            counter_box=counter_box,
+        )
+    if visibility != 'recognized' or local_numerator_box is None:
+        return CandiesOCRResult(
+            None, (), (), 'unrecognized', crop_box, None,
+            'Contador laranja incompleto ou sem separador visual confiável.',
+            counter_box, numerator_box,
+        )
+
+    numerator = crop.crop(local_numerator_box)
+    scaled = numerator.resize(
+        (numerator.width * 6, numerator.height * 6), Image.Resampling.LANCZOS
+    )
+    prepared = ImageOps.autocontrast(scaled.getchannel('R'))
     if tesseract_error:
         return CandiesOCRResult(
-            None, (), (), 'tesseract_unavailable', crop_box, prepared, tesseract_error
+            None, (), (), 'tesseract_unavailable', crop_box, prepared,
+            tesseract_error, counter_box, numerator_box,
         )
 
     raw_texts = []
     candidates = []
-    for variant in variants:
+    for psm in (7, 8):
         try:
             raw = pytesseract.image_to_string(
-                variant,
-                config='--psm 7 -c tessedit_char_whitelist=0123456789/',
+                prepared,
+                config=f'--psm {psm} -c tessedit_char_whitelist=0123456789',
                 timeout=2.5,
             )
         except pytesseract.pytesseract.TesseractNotFoundError as exc:
             return CandiesOCRResult(
                 None, tuple(candidates), tuple(raw_texts), 'tesseract_unavailable',
-                crop_box, prepared, str(exc)
+                crop_box, prepared, str(exc), counter_box, numerator_box,
             )
         except OSError as exc:
             return CandiesOCRResult(
                 None, tuple(candidates), tuple(raw_texts), 'tesseract_unavailable',
-                crop_box, prepared, str(exc)
+                crop_box, prepared, str(exc), counter_box, numerator_box,
             )
         except RuntimeError as exc:
             return CandiesOCRResult(
                 None, tuple(candidates), tuple(raw_texts), 'ocr_error',
-                crop_box, prepared, str(exc)
+                crop_box, prepared, str(exc), counter_box, numerator_box,
             )
         raw_texts.append(raw.strip())
-        for match in re.finditer(r'(?<!\d)(\d{1,3})\s*/\s*500', raw):
-            number = int(match.group(1))
+        if re.fullmatch(r'\d{1,3}', raw.strip()):
+            number = int(raw.strip())
             if 0 <= number <= 500:
                 candidates.append(number)
 
@@ -323,19 +519,20 @@ def analyze_candies(screenshot_image, region=None, *, tesseract_error=None):
     if len(distinct) == 1:
         value = distinct.pop()
         return CandiesOCRResult(
-            value, tuple(candidates), tuple(raw_texts), 'recognized', crop_box, prepared
+            value, tuple(candidates), tuple(raw_texts), 'recognized', crop_box,
+            prepared, counter_box=counter_box, numerator_box=numerator_box,
         )
     if len(distinct) > 1:
         return CandiesOCRResult(
-            None, tuple(candidates), tuple(raw_texts), 'divergent', crop_box, prepared,
-            f'Variantes OCR divergentes: {sorted(distinct)}.'
+            None, tuple(candidates), tuple(raw_texts), 'divergent', crop_box,
+            prepared, f'Variantes OCR divergentes: {sorted(distinct)}.',
+            counter_box, numerator_box,
         )
 
-    gray = ImageOps.grayscale(crop)
-    extrema = gray.getextrema()
-    stddev = ImageStat.Stat(gray).stddev[0]
-    reason = 'not_visible' if extrema[1] - extrema[0] < 18 or stddev < 4 else 'unrecognized'
-    return CandiesOCRResult(None, (), tuple(raw_texts), reason, crop_box, prepared)
+    return CandiesOCRResult(
+        None, (), tuple(raw_texts), 'unrecognized', crop_box, prepared,
+        counter_box=counter_box, numerator_box=numerator_box,
+    )
 
 
 def read_candies(screenshot_image, region=None, return_candidates=False):
@@ -355,6 +552,16 @@ OCR_REASON_LABELS = {
     'capture_failed': 'Falha inesperada de captura',
     'ocr_error': 'Falha inesperada do OCR',
 }
+
+
+def ocr_test_block_reason(automation_active, starting, recording, test_running):
+    if recording:
+        return 'Interrompa ou cancele a gravação antes de testar o OCR.'
+    if test_running:
+        return 'Já existe um teste OCR em andamento.'
+    if automation_active or starting:
+        return 'Pare a automação antes de testar o OCR.'
+    return None
 
 
 def save_candies_diagnostic(shot, cfg, result=None, *, reason=None, error=None,
@@ -393,11 +600,28 @@ def save_candies_diagnostic(shot, cfg, result=None, *, reason=None, error=None,
             crop.save(folder / 'recorte_candies.png')
             prepared = result.prepared if result and result.prepared else prepared_images(crop, 'candies')[0]
             prepared.save(folder / 'preparada_tesseract.png')
+            if result and result.counter_box:
+                shot.crop(result.counter_box).save(folder / 'contador_localizado.png')
+            if result and result.numerator_box:
+                shot.crop(result.numerator_box).save(folder / 'numerador.png')
             annotated = shot.copy()
-            ImageDraw.Draw(annotated).rectangle(
+            draw = ImageDraw.Draw(annotated)
+            draw.rectangle(
                 (crop_box[0], crop_box[1], crop_box[2] - 1, crop_box[3] - 1),
                 outline=(255, 0, 0), width=max(2, round(shot.width / 700))
             )
+            if result and result.counter_box:
+                draw.rectangle(
+                    (result.counter_box[0], result.counter_box[1],
+                     result.counter_box[2] - 1, result.counter_box[3] - 1),
+                    outline=(0, 255, 0), width=max(2, round(shot.width / 700))
+                )
+            if result and result.numerator_box:
+                draw.rectangle(
+                    (result.numerator_box[0], result.numerator_box[1],
+                     result.numerator_box[2] - 1, result.numerator_box[3] - 1),
+                    outline=(255, 255, 0), width=max(2, round(shot.width / 700))
+                )
             annotated.save(folder / 'regiao_analisada.png')
         if client_bbox:
             user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -426,6 +650,9 @@ def save_candies_diagnostic(shot, cfg, result=None, *, reason=None, error=None,
         f'Escala DPI da janela: {dpi_scale}',
         f'Região normalizada (área cliente 1365x700): {region or "inválida"}',
         f'Recorte em pixels (imagem capturada): {crop_box or "indisponível"}',
+        f'Contador localizado (pixels da captura): {result.counter_box if result and result.counter_box else "não identificado"}',
+        f'Numerador isolado (pixels da captura): {result.numerator_box if result and result.numerator_box else "não identificado"}',
+        'Separador e denominador validados visualmente; o OCR recebe somente o numerador.',
         f'Executável Tesseract: {pytesseract.pytesseract.tesseract_cmd}',
     ]
     (folder / 'diagnostico.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
@@ -974,6 +1201,7 @@ class App:
         self._start_pending = False
         self._hidden_during_run = False
         self._pending_error = None
+        self._ocr_test_running = False
         self.recorder = GravadorRec()
         self.recorder.set_record_hotkey(self._record_hotkey_name)
         self.record_stage = None  # None | coleta | analise | compra
@@ -1077,8 +1305,10 @@ class App:
 
         actions = ttk.Frame(principal)
         actions.pack(fill='x', pady=(8, 0))
-        ttk.Button(actions, text='Testar OCR', command=self.test_ocr).pack(
-            side='left', fill='x', expand=True)
+        self.ocr_test_button = ttk.Button(
+            actions, text='Testar OCR', command=self.test_ocr
+        )
+        self.ocr_test_button.pack(side='left', fill='x', expand=True)
         ttk.Button(actions, text='Calibrar Candies',
                    command=lambda:self.calibrate('candies')).pack(
             side='left', fill='x', expand=True, padx=6)
@@ -1222,8 +1452,12 @@ class App:
                 self.log(f'Erro na gravação {k}: {e}')
 
     def calibrate(self, kind):
-        if self.controller.active():
-            messagebox.showwarning('Automação ativa','Pare a automação antes de calibrar.')
+        if (self.controller.active() or self._start_pending or
+                self.record_stage is not None or self._ocr_test_running):
+            messagebox.showwarning(
+                'Operação em andamento',
+                'Pare a automação, encerre a gravação ou aguarde o teste OCR antes de calibrar.'
+            )
             return
         self.root.withdraw()
         self.root.after(700, lambda: self._capture_calibration(kind))
@@ -1270,9 +1504,17 @@ class App:
                 return
             region=[round(left/width*1365), round(top/height*700),
                     round(right/width*1365),round(bottom/height*700)]
+            if kind == 'candies':
+                region = [
+                    max(0, region[0] - 30),
+                    max(0, region[1] - 16),
+                    min(1365, region[2] + 30),
+                    min(700, region[3] + 16),
+                ]
             self.data[kind+'_roi']=region
             self.save()
-            self.log(f'Região {kind} calibrada: {region}; teste a leitura com o item equipado.')
+            self.log(f'Região {kind} calibrada: {region}; '
+                     'a captura inclui margem de segurança.')
             win.destroy()
         canvas.bind('<ButtonPress-1>',down)
         canvas.bind('<B1-Motion>',move)
@@ -1286,16 +1528,46 @@ class App:
         except (AttributeError, OSError) as exc:
             messagebox.showerror('Diagnóstico indisponível', str(exc))
 
-    def test_ocr(self):
-        if self.controller.active():
-            messagebox.showwarning('Automação ativa', 'Pare a automação antes de testar o OCR.')
+    def _ocr_test_block_reason(self):
+        return ocr_test_block_reason(
+            self.controller.active(),
+            self._start_pending,
+            self.record_stage is not None or self.record_state != 'idle',
+            self._ocr_test_running,
+        )
+
+    def _refresh_ocr_test_button(self):
+        if not hasattr(self, 'ocr_test_button'):
             return
+        reason = self._ocr_test_block_reason()
+        if reason is None:
+            self.ocr_test_button.configure(state='normal', text='Testar OCR')
+        elif self._ocr_test_running:
+            self.ocr_test_button.configure(state='disabled', text='Teste OCR em andamento')
+        elif self.record_stage is not None or self.record_state != 'idle':
+            self.ocr_test_button.configure(
+                state='disabled', text='Interrompa a gravação para testar OCR'
+            )
+        else:
+            self.ocr_test_button.configure(
+                state='disabled', text='Pare a automação para testar OCR'
+            )
+
+    def test_ocr(self):
+        block_reason = self._ocr_test_block_reason()
+        if block_reason:
+            messagebox.showwarning('Teste OCR indisponível', block_reason)
+            return
+        self._ocr_test_running = True
+        self._refresh_ocr_test_button()
         # Ocultar a janela do próprio AutoFarm: ela cobre parte dos Candies.
         self.root.withdraw()
         def task():
             result_message = ''
             shot = None
             capture_bbox = None
+            result = None
+            folder = None
             try:
                 time.sleep(0.65)
                 activate_roblox_window()
@@ -1328,18 +1600,19 @@ class App:
                 if result.value is not None:
                     self.events.put(('candies', str(result.value)))
                 result_message = (
-                    f'{label}\n'
-                    f'Candies: {result.value if result.value is not None else "não identificado"}\n\n'
+                    f'Leitura {"válida" if result.value is not None else "inconclusiva"}\n'
+                    f'Numerador: {result.value if result.value is not None else "não identificado"}\n'
+                    f'Região da captura: {result.crop_box or "não identificada"}\n\n'
                     f'Diagnóstico visual: {folder}'
                 )
             except Exception as e:
                 reason = 'capture_failed' if shot is None else 'ocr_error'
-                failure_result = CandiesOCRResult(
+                result = CandiesOCRResult(
                     None, (), (), reason, None, None, str(e)
                 ) if shot is not None else None
                 try:
                     folder = save_candies_diagnostic(
-                        shot, self.data, failure_result, reason=reason,
+                        shot, self.data, result, reason=reason,
                         error=str(e), client_bbox=capture_bbox
                     )
                     self.events.put(('log', f'OCR Candies: {OCR_REASON_LABELS[reason]}: '
@@ -1354,12 +1627,84 @@ class App:
                     result_message = f'Falha no teste OCR: {e}\nFalha no diagnóstico: {diagnostic_error}'
             finally:
                 self.events.put(('restore_window', None))
-                if result_message:
-                    self.events.put(('ocr_test_result', result_message))
-        threading.Thread(target=task,daemon=True).start()
+                self.events.put((
+                    'ocr_test_result', (result_message, shot, result, folder)
+                ))
+        worker = threading.Thread(target=task, daemon=True)
+        try:
+            worker.start()
+        except RuntimeError as exc:
+            self._ocr_test_running = False
+            self.root.deiconify()
+            self._refresh_ocr_test_button()
+            messagebox.showerror('Teste OCR indisponível', str(exc))
+
+    def _show_ocr_test_result(self, payload):
+        message, shot, result, _folder = payload
+        win = tk.Toplevel(self.root)
+        win.title('Resultado do teste OCR dos Candies')
+        win.transient(self.root)
+        win.grab_set()
+        ttk.Label(win, text=message, justify='left', wraplength=650).pack(
+            padx=14, pady=(12, 8), anchor='w'
+        )
+        if shot is not None and result is not None and result.crop_box:
+            preview = shot.crop(result.crop_box)
+            draw = ImageDraw.Draw(preview)
+            roi_left, roi_top = result.crop_box[:2]
+            if result.counter_box:
+                box = (
+                    result.counter_box[0] - roi_left,
+                    result.counter_box[1] - roi_top,
+                    result.counter_box[2] - roi_left,
+                    result.counter_box[3] - roi_top,
+                )
+                draw.rectangle(box, outline=(0, 255, 0), width=2)
+            if result.numerator_box:
+                box = (
+                    result.numerator_box[0] - roi_left,
+                    result.numerator_box[1] - roi_top,
+                    result.numerator_box[2] - roi_left,
+                    result.numerator_box[3] - roi_top,
+                )
+                draw.rectangle(box, outline=(255, 255, 0), width=2)
+            preview_scale = min(640 / preview.width, 240 / preview.height, 6)
+            preview = preview.resize(
+                (max(1, round(preview.width * preview_scale)),
+                 max(1, round(preview.height * preview_scale))),
+                Image.Resampling.LANCZOS,
+            )
+            win._region_photo = ImageTk.PhotoImage(preview)
+            ttk.Label(
+                win,
+                text='Região analisada (verde: contador; amarelo: numerador)',
+            ).pack(anchor='w', padx=14)
+            ttk.Label(win, image=win._region_photo).pack(padx=14, pady=(4, 8))
+            if result.numerator_box:
+                numerator = shot.crop(result.numerator_box)
+                numerator_scale = min(
+                    360 / numerator.width, 120 / numerator.height, 10
+                )
+                numerator = numerator.resize(
+                    (max(1, round(numerator.width * numerator_scale)),
+                     max(1, round(numerator.height * numerator_scale))),
+                    Image.Resampling.LANCZOS,
+                )
+                win._numerator_photo = ImageTk.PhotoImage(numerator)
+                ttk.Label(win, text='Numerador isolado:').pack(
+                    anchor='w', padx=14
+                )
+                ttk.Label(win, image=win._numerator_photo).pack(
+                    padx=14, pady=(4, 10)
+                )
+        ttk.Button(win, text='Fechar', command=win.destroy).pack(pady=(0, 12))
 
     def arm_recording(self, stage):
         """Seleciona a etapa, oculta a janela e aguarda a tecla configurada."""
+        if self._ocr_test_running:
+            messagebox.showwarning('Teste OCR em andamento',
+                                   'Aguarde o teste OCR terminar antes de iniciar uma gravação.')
+            return
         if self.controller.active() or self._start_pending:
             messagebox.showwarning('Automação ativa', 'Pare a automação antes de gravar uma nova etapa.')
             return
@@ -1532,6 +1877,10 @@ class App:
             self._hotkey_pressed = False
 
     def start(self):
+        if self._ocr_test_running:
+            messagebox.showwarning('Teste OCR em andamento',
+                                   'Aguarde o teste OCR terminar antes de iniciar a automação.')
+            return
         if self.record_stage is not None:
             messagebox.showinfo('Gravador ativo',f'Pressione {self._record_hotkey_name.upper()} para salvar ou F12 para cancelar antes de iniciar.')
             return
@@ -1603,7 +1952,8 @@ class App:
                 elif key=='clock':self.clock_var.set(value)
                 elif key=='log':self.log(value)
                 elif key=='ocr_test_result':
-                    messagebox.showinfo('Teste OCR dos Candies', value)
+                    self._ocr_test_running = False
+                    self._show_ocr_test_result(value)
                 elif key=='error':
                     self.log('ERRO: '+value)
                     # Exibir o erro somente DEPOIS de restaurar a interface.
@@ -1616,6 +1966,7 @@ class App:
                         self.root.after(100, lambda m=msg: messagebox.showerror('Automação interrompida',m))
         except queue.Empty:
             pass
+        self._refresh_ocr_test_button()
         self.root.after(100,self.poll)
 
     def refresh_clock(self):

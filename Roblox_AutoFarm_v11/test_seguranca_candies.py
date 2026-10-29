@@ -25,6 +25,23 @@ class TestarSegurancaCandies(unittest.TestCase):
         self.assertTrue(r.confiavel_para_compra)
         self.assertEqual(r.valor, 250)
 
+    def test_251_confirma(self):
+        r = avaliar_leituras(self.leituras([251]*12), self.fim)
+        self.assertTrue(r.confiavel_para_compra)
+        self.assertEqual(r.valor, 251)
+
+    def test_cinco_leituras_estaveis_em_instantes_distintos(self):
+        leituras = [(100.0 + i, 250) for i in range(5)]
+        r = avaliar_leituras(leituras, 105.0)
+        self.assertTrue(r.confiavel_para_compra)
+        self.assertEqual(r.total, 5)
+
+    def test_leituras_repetidas_no_mesmo_instante_nao_confirmam(self):
+        leituras = [(100.0, 250)] * 3 + [(104.0, 250)] * 2
+        r = avaliar_leituras(leituras, 105.0)
+        self.assertFalse(r.confiavel_para_compra)
+        self.assertIn('instantes distintos', r.motivo)
+
     def test_371_confirma(self):
         r = avaliar_leituras(self.leituras([371]*12), self.fim)
         self.assertTrue(r.confiavel_para_compra)
