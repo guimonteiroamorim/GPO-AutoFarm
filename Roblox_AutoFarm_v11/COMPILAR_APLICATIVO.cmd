@@ -31,7 +31,7 @@ echo [3/4] Instalando PyInstaller no ambiente isolado...
 if errorlevel 1 goto error
 
 echo [4/4] Compilando executavel enxuto...
-"%PY%" -m PyInstaller --noconfirm --clean --onedir --windowed --noupx --name GPO_AutoFarm_v11 --collect-submodules pynput --exclude-module pandas --exclude-module pyarrow --exclude-module numpy --exclude-module scipy --exclude-module matplotlib --exclude-module cv2 --add-data "gravacoes;gravacoes" --add-data "referencias;referencias" main.py
+"%PY%" -m PyInstaller --noconfirm --clean --onedir --windowed --noupx --name GPO_AutoFarm_v11 --collect-submodules pynput --exclude-module pandas --exclude-module pyarrow --exclude-module numpy --exclude-module scipy --exclude-module matplotlib --exclude-module cv2 --add-data "gravacoes\gravacao_coleta_1.rec;gravacoes" --add-data "gravacoes\gravacao_analise_2.rec;gravacoes" --add-data "gravacoes\gravacao_compra_3.rec;gravacoes" main.py
 if errorlevel 1 goto error
 
 echo.

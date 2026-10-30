@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 import traceback
+import uuid
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -38,6 +39,7 @@ FROZEN = getattr(sys, 'frozen', False)
 LOCAL_APP_DATA = Path(os.environ.get('LOCALAPPDATA', str(ROOT)))
 LEGACY_USER_DATA = LOCAL_APP_DATA / 'RobloxAutoFarm'
 USER_DATA = LOCAL_APP_DATA / 'GPO_AutoFarm_v11' if FROZEN else ROOT
+CUSTOM_RECORDINGS_DIR = LOCAL_APP_DATA / 'GPO_AutoFarm_v11' / 'gravacoes'
 USER_DATA.mkdir(parents=True, exist_ok=True)
 CFG = USER_DATA / 'config.json'
 LEGACY_CFG = LEGACY_USER_DATA / 'config.json'
@@ -66,7 +68,13 @@ DEFAULT = {
 ROIS = {'candies': (580,535,790,610), 'clock': (1322,648,1365,661)}
 DEBUG = USER_DATA / 'diagnostico'
 CANDIES_OPERATION_LOCK = threading.RLock()
-OCR_EXCEPTION_LOG_LOCK = threading.Lock()
+OCR_EXCEPTION_LOG_LOCK = threading.RLock()
+DIAGNOSTIC_MAINTENANCE_LOCK = threading.RLock()
+RECORDING_STORAGE_LOCK = threading.RLock()
+OCR_EXCEPTION_LOG_MAX_BYTES = 1024 * 1024
+OCR_DIAGNOSTIC_FOLDER_LIMIT = 5
+OCR_AUDIT_IMAGE_LIMIT = 20
+OCR_CLOCK_DIAGNOSTIC_LIMIT = 5
 OCR_TIMEOUT_SECONDS = 2.5
 OCR_TIMEOUT_RETRIES = 1
 OCR_RETRY_DELAY_SECONDS = 0.15
@@ -107,16 +115,27 @@ def load():
     for key in ('coleta','analise','compra'):
         old = str(data.get(key,'')).strip()
         if old.lower().endswith('.exe'):
-            rec = str(Path(old).with_suffix('.rec'))
-            if (Path(rec).is_file() or (ROOT / rec).is_file()):
-                data[key] = rec
+            rec = Path(old).with_suffix('.rec')
+            if rec.is_file() or (ROOT / rec).is_file():
+                data[key] = str(rec)
             else:
                 data[key] = DEFAULT[key]
     return data
 
 def resolve(path):
     p = Path(path).expanduser()
-    return p if p.is_absolute() else BUNDLE_ROOT / p
+    if p.is_absolute():
+        return p
+    normalized = p.as_posix().lower()
+    if normalized in {
+            Path(DEFAULT[key]).as_posix().lower()
+            for key in ('coleta', 'analise', 'compra')}:
+        return BUNDLE_ROOT / p
+    for base in dict.fromkeys((USER_DATA, ROOT, CUSTOM_RECORDINGS_DIR.parent)):
+        candidate = base / p
+        if candidate.is_file():
+            return candidate
+    return BUNDLE_ROOT / p
 
 def macro_recording(path):
     p = resolve(path)
@@ -126,6 +145,101 @@ def macro_recording(path):
             return alternative
         raise ValueError('Selecione a gravação original .rec. Os .exe compilados são bloqueados pelo Windows.')
     return p
+
+
+def atomic_write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f'.{path.name}.{threading.get_ident()}.{time.time_ns()}.tmp'
+    )
+    try:
+        temporary.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8'
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def publish_custom_recording(stage, staged_path, client_bbox, persist_selection):
+    """Validates and atomically publishes one user's recording and metadata."""
+    filenames = {
+        'coleta': 'coleta_personalizada.rec',
+        'analise': 'analise_personalizada.rec',
+        'compra': 'compra_personalizada.rec',
+    }
+    if stage not in filenames:
+        raise ValueError(f'Categoria de gravação inválida: {stage}')
+
+    staged_path = Path(staged_path)
+    destination = CUSTOM_RECORDINGS_DIR / filenames[stage]
+    metadata_stage = caminho_metadados(staged_path)
+    metadata_destination = caminho_metadados(destination)
+    token = uuid.uuid4().hex
+    rec_backup = destination.with_name(f'.{destination.name}.{token}.backup')
+    metadata_backup = metadata_destination.with_name(
+        f'.{metadata_destination.name}.{token}.backup'
+    )
+    rec_published = False
+    metadata_published = False
+    committed = False
+    rollback_completed = True
+    rec_existed = destination.is_file()
+    metadata_existed = metadata_destination.is_file()
+
+    with RECORDING_STORAGE_LOCK:
+        try:
+            read_rec(staged_path)
+            if client_bbox is not None:
+                salvar_geometria(staged_path, client_bbox)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if rec_existed:
+                shutil.copy2(destination, rec_backup)
+            if metadata_existed:
+                shutil.copy2(metadata_destination, metadata_backup)
+
+            os.replace(staged_path, destination)
+            rec_published = True
+            if metadata_stage.is_file():
+                os.replace(metadata_stage, metadata_destination)
+            else:
+                metadata_destination.unlink(missing_ok=True)
+            metadata_published = True
+            persist_selection(destination)
+            committed = True
+        except Exception:
+            try:
+                if metadata_published:
+                    if metadata_existed and metadata_backup.is_file():
+                        os.replace(metadata_backup, metadata_destination)
+                    else:
+                        metadata_destination.unlink(missing_ok=True)
+                if rec_published:
+                    if rec_existed and rec_backup.is_file():
+                        os.replace(rec_backup, destination)
+                    else:
+                        destination.unlink(missing_ok=True)
+            except OSError:
+                rollback_completed = False
+                raise
+            raise
+        finally:
+            staged_path.unlink(missing_ok=True)
+            metadata_stage.unlink(missing_ok=True)
+            if committed or rollback_completed:
+                rec_backup.unlink(missing_ok=True)
+                metadata_backup.unlink(missing_ok=True)
+
+    return destination
+
+
+def discard_staged_recording(path):
+    path = Path(path)
+    for candidate in (
+            path, path.with_suffix('.part'), caminho_metadados(path)):
+        candidate.unlink(missing_ok=True)
+
 
 def roi_box(img, region):
     w, h = img.size
@@ -501,19 +615,53 @@ def write_ocr_exception_log(failures, context):
     path = DEBUG / 'ocr_exceptions.log'
     with OCR_EXCEPTION_LOG_LOCK:
         DEBUG.mkdir(parents=True, exist_ok=True)
-        with path.open('a', encoding='utf-8') as log:
-            for failure in failures:
-                log.write(
-                    f'\n[{time.strftime("%Y-%m-%d %H:%M:%S")}] '
-                    f'Contexto: {context}\n'
-                    f'Etapa: {failure.stage}\n'
-                    f'Tentativa: {failure.attempt}\n'
-                    f'Tipo: {failure.exception_type}\n'
-                    f'Mensagem: {failure.message}\n'
-                    f'Traceback completo:\n{failure.traceback_text.rstrip()}\n'
-                    f'---\n'
-                )
+        entries = ''.join(
+            f'\n[{time.strftime("%Y-%m-%d %H:%M:%S")}] '
+            f'Contexto: {context}\n'
+            f'Etapa: {failure.stage}\n'
+            f'Tentativa: {failure.attempt}\n'
+            f'Tipo: {failure.exception_type}\n'
+            f'Mensagem: {failure.message}\n'
+            f'Traceback completo:\n{failure.traceback_text.rstrip()}\n'
+            f'---\n'
+            for failure in failures
+        ).encode('utf-8')
+        backup = path.with_name(path.name + '.1')
+        _rotate_ocr_exception_log(path, backup)
+        if path.is_file() and path.stat().st_size + len(entries) > OCR_EXCEPTION_LOG_MAX_BYTES:
+            backup.unlink(missing_ok=True)
+            os.replace(path, backup)
+        if len(entries) > OCR_EXCEPTION_LOG_MAX_BYTES:
+            entries = entries[-OCR_EXCEPTION_LOG_MAX_BYTES:].decode(
+                'utf-8', errors='ignore'
+            ).encode('utf-8')
+        with path.open('ab') as log:
+            log.write(entries)
     return path
+
+
+def _rotate_ocr_exception_log(path=None, backup=None):
+    path = path or DEBUG / 'ocr_exceptions.log'
+    backup = backup or path.with_name(path.name + '.1')
+    with OCR_EXCEPTION_LOG_LOCK:
+        if path.is_file() and path.stat().st_size > OCR_EXCEPTION_LOG_MAX_BYTES:
+            data = path.read_bytes()[-OCR_EXCEPTION_LOG_MAX_BYTES:]
+            temporary = backup.with_name(f'.{backup.name}.{uuid.uuid4().hex}.tmp')
+            try:
+                temporary.write_bytes(data)
+                backup.unlink(missing_ok=True)
+                os.replace(temporary, backup)
+                path.unlink()
+            finally:
+                temporary.unlink(missing_ok=True)
+        if backup.is_file() and backup.stat().st_size > OCR_EXCEPTION_LOG_MAX_BYTES:
+            data = backup.read_bytes()[-OCR_EXCEPTION_LOG_MAX_BYTES:]
+            temporary = backup.with_name(f'.{backup.name}.{uuid.uuid4().hex}.tmp')
+            try:
+                temporary.write_bytes(data)
+                os.replace(temporary, backup)
+            finally:
+                temporary.unlink(missing_ok=True)
 
 
 def report_ocr_failures(result, context, emit):
@@ -1048,6 +1196,22 @@ def accumulate_analysis_result(result, captured_at, readings, interpretations):
     return True
 
 
+def automatic_diagnostic_samples(verdict, audits, failed_samples):
+    selected = []
+    if not verdict.confiavel_para_compra and (
+            len(verdict.distintos) > 1 or 'contradizem' in verdict.motivo):
+        for value in verdict.distintos:
+            audit = audits.get(value)
+            if audit and len(selected) < 2:
+                shot, result, _region, capture_bbox = audit
+                selected.append((
+                    shot, result, 'divergent', verdict.motivo,
+                    capture_bbox, _region,
+                ))
+    selected.extend(failed_samples[:max(0, 2 - len(selected))])
+    return selected[:2]
+
+
 OCR_REASON_LABELS = {
     'recognized': 'OCR reconhecido',
     'not_visible': 'Contador não visível',
@@ -1074,6 +1238,15 @@ def ocr_test_block_reason(automation_active, starting, recording, test_running):
 
 def save_candies_diagnostic(shot, cfg, result=None, *, reason=None, error=None,
                             client_bbox=None):
+    with DIAGNOSTIC_MAINTENANCE_LOCK:
+        return _save_candies_diagnostic_locked(
+            shot, cfg, result, reason=reason, error=error,
+            client_bbox=client_bbox,
+        )
+
+
+def _save_candies_diagnostic_locked(shot, cfg, result=None, *, reason=None,
+                                    error=None, client_bbox=None):
     """Guarda uma amostra completa para diagnóstico visual do contador."""
     DEBUG.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime('%Y%m%d_%H%M%S') + f'_{time.time_ns() % 1_000_000_000:09d}'
@@ -1199,26 +1372,71 @@ def save_candies_diagnostic(shot, cfg, result=None, *, reason=None, error=None,
     return folder
 
 
+DIAGNOSTIC_FOLDER_FILES = {
+    'area_cliente.png',
+    'recorte_candies.png',
+    'preparada_tesseract.png',
+    'contador_localizado.png',
+    'numerador.png',
+    'recorte_enviado_tesseract.png',
+    'regiao_analisada.png',
+    'diagnostico.txt',
+}
+
+
+def _is_owned_diagnostic_folder(path):
+    if not re.fullmatch(r'candies_\d{8}_\d{6}_\d{9}', path.name):
+        return False
+    children = list(path.iterdir())
+    return any(child.is_file() and child.name == 'diagnostico.txt'
+               for child in children)
+
+
 def prune_candies_diagnostics():
-    if not DEBUG.is_dir():
-        return
-    folders = sorted(
-        (path for path in DEBUG.glob('candies_*') if path.is_dir()),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    for old in folders[10:]:
-        for child in old.iterdir():
-            if child.is_file():
-                child.unlink()
-        old.rmdir()
-    audits = sorted(
-        DEBUG.glob('*_compra_*_contador.png'),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    for old in audits[20:]:
-        old.unlink()
+    with DIAGNOSTIC_MAINTENANCE_LOCK:
+        if not DEBUG.is_dir():
+            return
+        _rotate_ocr_exception_log()
+        folders = sorted(
+            (path for path in DEBUG.iterdir()
+             if path.is_dir() and _is_owned_diagnostic_folder(path)),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for old in folders[OCR_DIAGNOSTIC_FOLDER_LIMIT:]:
+            for child in old.iterdir():
+                if child.is_file() and child.name in DIAGNOSTIC_FOLDER_FILES:
+                    child.unlink()
+            if not any(old.iterdir()):
+                old.rmdir()
+
+        audit_pattern = re.compile(
+            r'\d{8}_\d{6}_compra_(?:autorizada|bloqueada)_contador\.png'
+        )
+        audits = sorted(
+            (path for path in DEBUG.iterdir()
+             if path.is_file() and audit_pattern.fullmatch(path.name)),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for old in audits[OCR_AUDIT_IMAGE_LIMIT:]:
+            old.unlink()
+
+        clock_pattern = re.compile(
+            r'(\d{8}_\d{6})_relogio_(?:tela|recorte|ampliado)\.png'
+        )
+        clock_diagnostics = {}
+        for path in DEBUG.iterdir():
+            match = clock_pattern.fullmatch(path.name)
+            if path.is_file() and match:
+                clock_diagnostics.setdefault(match.group(1), []).append(path)
+        recent_clock_stamps = set(sorted(clock_diagnostics, reverse=True)[
+            :OCR_CLOCK_DIAGNOSTIC_LIMIT
+        ])
+        for stamp, paths in clock_diagnostics.items():
+            if stamp not in recent_clock_stamps:
+                for path in paths:
+                    path.unlink()
 
 
 def parse_clock_text(raw):
@@ -1289,6 +1507,9 @@ def save_clock_diagnostic(shot, cfg):
         piece.save(DEBUG / f'{stamp}_relogio_recorte.png')
         piece.resize((piece.width*8, piece.height*8), Image.Resampling.NEAREST).save(
             DEBUG / f'{stamp}_relogio_ampliado.png')
+        threading.Thread(
+            target=prune_candies_diagnostics, daemon=True
+        ).start()
     except Exception:
         pass
 
@@ -1385,6 +1606,25 @@ class Controller:
         self.stop.set()
         self.emit('status','Parando...')
 
+    def _save_diagnostics_async(self, samples):
+        if not samples:
+            return
+
+        def save_samples():
+            saved = []
+            for shot, result, reason, error, capture_bbox, _region in samples[:2]:
+                try:
+                    saved.append(save_candies_diagnostic(
+                        shot, self.cfg, result, reason=reason, error=error,
+                        client_bbox=capture_bbox,
+                    ))
+                except Exception as exc:
+                    self.emit('log', f'Não consegui salvar o diagnóstico OCR: {exc}')
+            if saved:
+                self.emit('log', f'Diagnóstico visual do OCR salvo em {DEBUG}.')
+
+        threading.Thread(target=save_samples, daemon=True).start()
+
     def run_macro(self, key, inspect=False):
         """Executa eventos em ordem com tempos absolutos.
 
@@ -1418,7 +1658,6 @@ class Controller:
         diagnostic_samples = []
         sampled_reasons = set()
         failure_counts = Counter()
-        latest_valid_shot = [None]
         audit_by_value = {}
         ocr_attempts = [0]
         ocr_finished = threading.Event()
@@ -1465,7 +1704,6 @@ class Controller:
                         )
                         value = result.value
                         if value is not None:
-                            latest_valid_shot[0] = shot
                             if value not in audit_by_value and len(audit_by_value) < 5:
                                 audit_by_value[value] = (
                                     shot.copy(), result, candy_region, capture_bbox
@@ -1571,48 +1809,14 @@ class Controller:
             label = OCR_REASON_LABELS.get(reason, reason)
             self.emit('log', f'OCR Candies: {label} ({count} tentativa(s)).')
 
-        selected_diagnostics = []
         if not veredito.confiavel_para_compra and (
                 len(veredito.distintos) > 1 or 'contradizem' in veredito.motivo):
             self.emit('log', f'OCR Candies: {OCR_REASON_LABELS["divergent"]}. '
                              f'{veredito.motivo}')
-            for value in veredito.distintos:
-                audit = audit_by_value.get(value)
-                if audit and len(selected_diagnostics) < 2:
-                    shot, result, candy_region, capture_bbox = audit
-                    selected_diagnostics.append((
-                        shot, result, 'divergent', veredito.motivo,
-                        capture_bbox, candy_region
-                    ))
-        for sample in diagnostic_samples:
-            if len(selected_diagnostics) >= 2:
-                break
-            selected_diagnostics.append(sample)
-
-        diagnostic_paths = []
-        for shot, result, reason, error, capture_bbox, _ in selected_diagnostics[:2]:
-            try:
-                diagnostic_paths.append(save_candies_diagnostic(
-                    shot, self.cfg, result, reason=reason, error=error,
-                    client_bbox=capture_bbox
-                ))
-            except Exception as exc:
-                self.emit('log', f'Não consegui salvar o diagnóstico OCR: {exc}')
-        if diagnostic_paths:
-            self.emit('log', f'Diagnóstico visual do OCR salvo em {DEBUG}.')
-
-        # Auditoria local: guardar o recorte real que precedeu a decisão.
-        # Não salva a tela inteira normalmente, para reduzir exposição de informações.
-        stamp = time.strftime('%Y%m%d_%H%M%S')
-        if latest_valid_shot[0] is not None:
-            try:
-                DEBUG.mkdir(parents=True, exist_ok=True)
-                nome = 'compra_autorizada' if veredito.confiavel_para_compra else 'compra_bloqueada'
-                roi(latest_valid_shot[0], region_from(self.cfg, 'candies')).save(
-                    DEBUG / f'{stamp}_{nome}_contador.png')
-                prune_candies_diagnostics()
-            except Exception as e:
-                self.emit('log', f'Não consegui salvar imagem de auditoria: {e}')
+        selected_diagnostics = automatic_diagnostic_samples(
+            veredito, audit_by_value, diagnostic_samples
+        )
+        self._save_diagnostics_async(selected_diagnostics)
         if len(veredito.distintos) > 1:
             self.emit('log', f'Leituras contraditórias bloqueadas; amostras salvas em {DEBUG}.')
         return veredito
@@ -1759,7 +1963,21 @@ class App:
             win32_event_filter=self.recorder.keyboard_filter)
         self.listener.start()
         self.root.after(100, self.poll)
+        self.root.after(0, self._schedule_diagnostic_cleanup)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
+
+    def _schedule_diagnostic_cleanup(self):
+        def cleanup():
+            try:
+                prune_candies_diagnostics()
+            except OSError as exc:
+                self.events.put((
+                    'log',
+                    f'Não consegui limpar diagnósticos antigos: '
+                    f'{type(exc).__name__}: {exc}',
+                ))
+
+        threading.Thread(target=cleanup, daemon=True).start()
 
     def construct(self):
         """Layout em abas. Mantém os mesmos comandos e variáveis da v10."""
@@ -1944,7 +2162,7 @@ class App:
             self.data[key] = value.copy() if isinstance(value, list) else value
         self.clock_input.set('00:00:00')
         self.invalidate_clock()
-        CFG.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding='utf-8')
+        atomic_write_json(CFG, self.data)
         self.log('Automação restaurada: gravações e calibração padrão; relógio invalidado. '
                  'As gravações personalizadas foram preservadas.')
 
@@ -2342,26 +2560,44 @@ class App:
         if self.record_state != 'recording':
             return
         stage = self.record_stage
-        stamp = time.strftime('%Y%m%d_%H%M%S')
-        destination_dir = (USER_DATA if getattr(sys, 'frozen', False) else ROOT) / 'gravacoes'
-        destination = destination_dir / f'gravacao_{stage}_{stamp}.rec'
+        staged_path = CUSTOM_RECORDINGS_DIR / (
+            f'.{stage}_{uuid.uuid4().hex}.staging.rec'
+        )
+        previous_selection = self.fields[stage].get()
+        previous_data_selection = self.data.get(stage, DEFAULT[stage])
         try:
-            result = self.recorder.finish(destination)
-            events = read_rec(destination)
-            if self.recording_client_bbox:
-                salvar_geometria(destination, self.recording_client_bbox)
+            CUSTOM_RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+            result = self.recorder.finish(staged_path)
+            events = read_rec(staged_path)
+
+            def persist_selection(destination):
+                self.fields[stage].set(str(destination))
+                if not self.save():
+                    raise RuntimeError('Não foi possível salvar a seleção da gravação.')
+
+            destination = publish_custom_recording(
+                stage, staged_path, self.recording_client_bbox,
+                persist_selection,
+            )
             self.recording_client_bbox = None
-            self.fields[stage].set(str(destination))
             self.record_stage = None
             self.record_state = 'idle'
             self._restore_interface()
             self.status.set('Parado')
-            self.save()
             self.log(f'Nova gravação {stage.upper()} salva: {destination.name} | '
                      f'{events[-1].offset:.1f}s | {len(events)} eventos.')
             if result['wheel_ignored']:
                 self.log(f'AVISO: {result["wheel_ignored"]} rolagens de mouse foram ignoradas. Evite usar a roda nas gravações.')
         except Exception as exc:
+            self.fields[stage].set(previous_selection)
+            self.data[stage] = previous_data_selection
+            try:
+                discard_staged_recording(staged_path)
+            except OSError as cleanup_error:
+                self.log(
+                    f'Não consegui remover arquivo temporário de gravação: '
+                    f'{cleanup_error}'
+                )
             self._cancel_recording()
             messagebox.showerror('Falha ao salvar gravação', str(exc))
 
@@ -2439,7 +2675,7 @@ class App:
         self._hotkey_name = hk
         self._record_hotkey_name = rh
         self.recorder.set_record_hotkey(rh)
-        CFG.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding='utf-8')
+        atomic_write_json(CFG, self.data)
         self.log('Configurações salvas.')
         return True
 

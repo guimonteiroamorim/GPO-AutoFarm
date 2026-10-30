@@ -753,7 +753,8 @@ class TestCandiesOCR(unittest.TestCase):
                     patch.object(main, 'carregar_geometria', return_value=None), \
                     patch.object(main, 'screenshot_with_bbox', return_value=(frame, (0, 0, 1365, 700))), \
                     patch.object(main.pytesseract, 'image_to_string', side_effect=slow_ocr), \
-                    patch.object(main, 'DEBUG', Path(temp) / 'diagnostico'):
+                    patch.object(main, 'DEBUG', Path(temp) / 'diagnostico'), \
+                    patch.object(main.Controller, '_save_diagnostics_async'):
                 controller.run_macro('analise', inspect=True)
 
         self.assertEqual(len(seen), len(offsets))

@@ -39,6 +39,27 @@ cinco leituras concordantes em instantes distintos, ausência de contradições,
 leitura recente, boss ausente, relógio manual sincronizado e margem suficiente
 antes do spawn. Os arquivos .rec e sua reprodução não foram alterados.
 
+GRAVAÇÕES PERSONALIZADAS
+------------------------
+Gravar agora mantém somente um arquivo pessoal por categoria em
+%LOCALAPPDATA%\GPO_AutoFarm_v11\gravacoes:
+coleta_personalizada.rec, analise_personalizada.rec e
+compra_personalizada.rec. Uma substituição é validada antes de publicar o
+arquivo e seus metadados; cancelar ou falhar preserva a versão anterior.
+A seleção continua salva após reiniciar. Restaurar padrão apenas seleciona
+as gravações padrão e não apaga personalizadas, arquivos antigos com timestamp
+ou gravações externas. O compilador inclui somente os três .rec padrão.
+
+RETENÇÃO DE DIAGNÓSTICOS
+------------------------
+A limpeza mantém as cinco pastas de diagnóstico OCR mais recentes, limita
+imagens de auditoria soltas a vinte e imagens do relógio às cinco capturas
+mais recentes. Na automação, capturas de evidência são salvas apenas em falhas,
+leituras inconclusivas ou contradições; Testar OCR ainda salva seu diagnóstico.
+ocr_exceptions.log é limitado a 1 MiB com uma rotação adicional de 1 MiB.
+Pastas ou arquivos que não correspondam aos nomes e conteúdo gerados pelo
+AutoFarm não são removidos.
+
 Implementação: main.py (locate_candies_counter, analyze_candies,
 run_tesseract_variants, capture_candies_attempt, write_ocr_exception_log,
 save_candies_diagnostic, App.test_ocr e App._show_ocr_test_result),
