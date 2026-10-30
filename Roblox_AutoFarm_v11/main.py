@@ -1,13 +1,16 @@
 """Controlador das gravações originais TinyTask (.rec). Windows / Python 3.10+."""
 import json
+import errno
 import math
 import queue
 import re
 import sys
+import subprocess
 import threading
 import time
+import traceback
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 import tkinter as tk
@@ -62,6 +65,11 @@ DEFAULT = {
 # Ajustadas com capturas de 1365x700 e 1366x697 (janela 1366x768).
 ROIS = {'candies': (580,535,790,610), 'clock': (1322,648,1365,661)}
 DEBUG = USER_DATA / 'diagnostico'
+CANDIES_OPERATION_LOCK = threading.RLock()
+OCR_EXCEPTION_LOG_LOCK = threading.Lock()
+OCR_TIMEOUT_SECONDS = 2.5
+OCR_TIMEOUT_RETRIES = 1
+OCR_RETRY_DELAY_SECONDS = 0.15
 
 def region_from(cfg, kind):
     result = cfg.get(kind+'_roi', ROIS[kind]) if cfg else ROIS[kind]
@@ -260,6 +268,15 @@ def prepared_images(pil, kind):
 
 
 @dataclass(frozen=True)
+class OCRFailure:
+    stage: str
+    attempt: int
+    exception_type: str
+    message: str
+    traceback_text: str
+
+
+@dataclass(frozen=True)
 class CandiesOCRResult:
     value: int | None
     candidates: tuple[int, ...]
@@ -270,13 +287,264 @@ class CandiesOCRResult:
     error: str | None = None
     counter_box: tuple[int, int, int, int] | None = None
     numerator_box: tuple[int, int, int, int] | None = None
+    failures: tuple[OCRFailure, ...] = ()
+    rejection_stage: str | None = None
+    rejection_detail: str | None = None
+    components: tuple[dict, ...] = ()
+    ocr_crop_box: tuple[int, int, int, int] | None = None
+    fallback_raw_texts: tuple[str, ...] = ()
+    locator_trace: dict | None = None
+    candidatos_validos: tuple[tuple[str, int], ...] = ()
+    leituras_malformadas: tuple[tuple[str, str], ...] = ()
+    leituras_inconclusivas: tuple[tuple[str, str], ...] = ()
+    contradicoes: tuple[int, ...] = ()
+    motivo_decisao: str | None = None
+
+
+def ocr_failure_from_exception(stage, attempt, exc):
+    return OCRFailure(
+        stage=stage,
+        attempt=attempt,
+        exception_type=type(exc).__name__,
+        message=str(exc),
+        traceback_text=traceback.format_exc(),
+    )
+
+
+def technical_ocr_result(reason, stage, exc, *, shot=None, crop_box=None,
+                         prepared=None, counter_box=None, numerator_box=None,
+                         candidates=(), raw_texts=(), attempt=1,
+                         prior_failures=(), rejection_stage=None,
+                         rejection_detail=None, components=(),
+                         ocr_crop_box=None, locator_trace=None):
+    failure = ocr_failure_from_exception(stage, attempt, exc)
+    return CandiesOCRResult(
+        None, tuple(candidates), tuple(raw_texts), reason, crop_box, prepared,
+        str(exc), counter_box, numerator_box, tuple(prior_failures) + (failure,),
+        rejection_stage, rejection_detail, tuple(components), ocr_crop_box,
+        (), locator_trace,
+    )
+
+
+def _is_tesseract_timeout(exc):
+    return (
+        isinstance(exc, subprocess.TimeoutExpired) or
+        isinstance(exc, RuntimeError) and
+        not isinstance(exc, pytesseract.pytesseract.TesseractError) and
+        str(exc) == 'Tesseract process timeout'
+    )
+
+
+def run_tesseract_variants(prepared, config_suffix, stage_prefix, *, crop_box,
+                           counter_box, numerator_box, rejection_stage,
+                           rejection_detail, components, parse_candidate,
+                           locator_trace, fallback_crop_box=None,
+                           minimum_digits=1):
+    raw_texts = []
+    candidates = []
+    malformed = []
+    inconclusive = []
+    failures = []
+    for psm in (7, 8):
+        for attempt in range(1, OCR_TIMEOUT_RETRIES + 2):
+            try:
+                raw = pytesseract.image_to_string(
+                    prepared,
+                    config=f'--psm {psm} -c tessedit_char_whitelist={config_suffix}',
+                    timeout=OCR_TIMEOUT_SECONDS,
+                )
+                break
+            except pytesseract.pytesseract.TesseractNotFoundError as exc:
+                return (raw_texts, candidates, malformed, inconclusive,
+                        failures, technical_ocr_result(
+                    'tesseract_unavailable', f'{stage_prefix}_psm_{psm}', exc,
+                    crop_box=crop_box, prepared=prepared, counter_box=counter_box,
+                    numerator_box=numerator_box, candidates=candidates,
+                    raw_texts=raw_texts, attempt=attempt,
+                    prior_failures=failures, rejection_stage=rejection_stage,
+                    rejection_detail=rejection_detail, components=components,
+                    ocr_crop_box=fallback_crop_box or numerator_box,
+                    locator_trace=locator_trace,
+                ))
+            except subprocess.TimeoutExpired as exc:
+                failures.append(ocr_failure_from_exception(
+                    f'{stage_prefix}_psm_{psm}', attempt, exc
+                ))
+                if attempt <= OCR_TIMEOUT_RETRIES:
+                    time.sleep(OCR_RETRY_DELAY_SECONDS)
+                    continue
+                result = CandiesOCRResult(
+                    None, tuple(candidates), tuple(raw_texts), 'ocr_timeout',
+                    crop_box, prepared, str(exc), counter_box, numerator_box,
+                    tuple(failures), rejection_stage, rejection_detail,
+                    tuple(components), fallback_crop_box or numerator_box,
+                    (), locator_trace,
+                )
+                return raw_texts, candidates, malformed, inconclusive, failures, result
+            except pytesseract.pytesseract.TesseractError as exc:
+                return (raw_texts, candidates, malformed, inconclusive,
+                        failures, technical_ocr_result(
+                    'ocr_error', f'{stage_prefix}_psm_{psm}', exc,
+                    crop_box=crop_box, prepared=prepared, counter_box=counter_box,
+                    numerator_box=numerator_box, candidates=candidates,
+                    raw_texts=raw_texts, attempt=attempt,
+                    prior_failures=failures, rejection_stage=rejection_stage,
+                    rejection_detail=rejection_detail, components=components,
+                    ocr_crop_box=fallback_crop_box or numerator_box,
+                    locator_trace=locator_trace,
+                ))
+            except RuntimeError as exc:
+                if _is_tesseract_timeout(exc):
+                    failures.append(ocr_failure_from_exception(
+                        f'{stage_prefix}_psm_{psm}', attempt, exc
+                    ))
+                    if attempt <= OCR_TIMEOUT_RETRIES:
+                        time.sleep(OCR_RETRY_DELAY_SECONDS)
+                        continue
+                    result = CandiesOCRResult(
+                        None, tuple(candidates), tuple(raw_texts), 'ocr_timeout',
+                        crop_box, prepared, str(exc), counter_box, numerator_box,
+                        tuple(failures), rejection_stage, rejection_detail,
+                        tuple(components), fallback_crop_box or numerator_box,
+                        (), locator_trace,
+                    )
+                    return raw_texts, candidates, malformed, inconclusive, failures, result
+                return (raw_texts, candidates, malformed, inconclusive,
+                        failures, technical_ocr_result(
+                    'ocr_error', f'{stage_prefix}_psm_{psm}', exc,
+                    crop_box=crop_box, prepared=prepared, counter_box=counter_box,
+                    numerator_box=numerator_box, candidates=candidates,
+                    raw_texts=raw_texts, attempt=attempt,
+                    prior_failures=failures, rejection_stage=rejection_stage,
+                    rejection_detail=rejection_detail, components=components,
+                    ocr_crop_box=fallback_crop_box or numerator_box,
+                    locator_trace=locator_trace,
+                ))
+            except Exception as exc:
+                return (raw_texts, candidates, malformed, inconclusive,
+                        failures, technical_ocr_result(
+                    'ocr_error', f'{stage_prefix}_psm_{psm}', exc,
+                    crop_box=crop_box, prepared=prepared, counter_box=counter_box,
+                    numerator_box=numerator_box, candidates=candidates,
+                    raw_texts=raw_texts, attempt=attempt,
+                    prior_failures=failures, rejection_stage=rejection_stage,
+                    rejection_detail=rejection_detail, components=components,
+                    ocr_crop_box=fallback_crop_box or numerator_box,
+                    locator_trace=locator_trace,
+                ))
+
+        text = raw.strip()
+        raw_texts.append(text)
+        candidate = parse_candidate(text)
+        if candidate is not None and (
+                stage_prefix != 'numerator_tesseract' or
+                len(text) >= minimum_digits):
+            candidates.append(candidate)
+        elif candidate is not None:
+            inconclusive.append(text)
+        elif text:
+            malformed.append(text)
+        else:
+            inconclusive.append(text)
+    return raw_texts, candidates, malformed, inconclusive, failures, None
+
+
+def _is_transient_capture_error(exc):
+    transient_errnos = {
+        errno.EAGAIN,
+        errno.EINTR,
+        errno.EBUSY,
+        errno.ETIMEDOUT,
+    }
+    transient_winerrors = {32, 33, 170}
+    return (
+        exc.errno in transient_errnos or
+        getattr(exc, 'winerror', None) in transient_winerrors
+    )
+
+
+def capture_candies_attempt(region):
+    failures = []
+    for attempt in range(1, 3):
+        shot = None
+        client_bbox = None
+        try:
+            with CANDIES_OPERATION_LOCK:
+                shot, client_bbox = screenshot_with_bbox()
+                result = analyze_candies(shot, region)
+        except OSError as exc:
+            failures.append(ocr_failure_from_exception('screen_capture', attempt, exc))
+            if attempt == 1 and _is_transient_capture_error(exc):
+                time.sleep(OCR_RETRY_DELAY_SECONDS)
+                continue
+            result = CandiesOCRResult(
+                None, (), (), 'capture_failed', None, None, str(exc),
+                failures=tuple(failures),
+            )
+            return shot, None, result
+        except Exception as exc:
+            result = technical_ocr_result(
+                'capture_failed' if shot is None else 'ocr_error',
+                'screen_capture' if shot is None else 'ocr_pipeline',
+                exc, shot=shot, attempt=attempt, prior_failures=failures,
+            )
+            return shot, client_bbox, result
+        if failures:
+            result = replace(result, failures=tuple(failures) + result.failures)
+        return shot, client_bbox, result
+    raise RuntimeError('Captura OCR terminou sem resultado após as tentativas limitadas.')
+
+
+def write_ocr_exception_log(failures, context):
+    if not failures:
+        return None
+    path = DEBUG / 'ocr_exceptions.log'
+    with OCR_EXCEPTION_LOG_LOCK:
+        DEBUG.mkdir(parents=True, exist_ok=True)
+        with path.open('a', encoding='utf-8') as log:
+            for failure in failures:
+                log.write(
+                    f'\n[{time.strftime("%Y-%m-%d %H:%M:%S")}] '
+                    f'Contexto: {context}\n'
+                    f'Etapa: {failure.stage}\n'
+                    f'Tentativa: {failure.attempt}\n'
+                    f'Tipo: {failure.exception_type}\n'
+                    f'Mensagem: {failure.message}\n'
+                    f'Traceback completo:\n{failure.traceback_text.rstrip()}\n'
+                    f'---\n'
+                )
+    return path
+
+
+def report_ocr_failures(result, context, emit):
+    if not result or not result.failures:
+        return
+    try:
+        path = write_ocr_exception_log(result.failures, context)
+        emit('log', f'Exceção técnica OCR registrada em {path}.')
+    except OSError as exc:
+        emit('log', f'ERRO ao salvar traceback OCR ({context}): {type(exc).__name__}: {exc}')
+    for failure in result.failures:
+        emit(
+            'log',
+            f'OCR técnico em {failure.stage}, tentativa {failure.attempt}: '
+            f'{failure.exception_type}: {failure.message}',
+        )
 
 
 def locate_candies_counter(crop):
     """Localiza o contador laranja e recorta o numerador antes da barra."""
     width, height = crop.size
+    details = {
+        'stage': 'color_segmentation',
+        'detail': None,
+        'components': [],
+        'separator_candidates': [],
+        'layouts': [],
+    }
     if width <= 0 or height <= 0:
-        return 'not_visible', None, None
+        details['detail'] = 'ROI vazio.'
+        return 'not_visible', None, None, details
 
     pixels = crop.load()
     mask = bytearray(width * height)
@@ -294,7 +562,8 @@ def locate_candies_counter(crop):
     active_rows = [y for y, count in enumerate(row_counts)
                    if count >= row_threshold]
     if not active_rows:
-        return 'not_visible', None, None
+        details['detail'] = 'Nenhuma linha atingiu o limiar de pixels laranja.'
+        return 'not_visible', None, None, details
 
     runs = []
     for y in active_rows:
@@ -311,7 +580,8 @@ def locate_candies_counter(crop):
         if mask[y * width + x]
     ]
     if not line_pixels:
-        return 'not_visible', None, None
+        details['detail'] = 'A máscara de cor não contém pixels na linha selecionada.'
+        return 'not_visible', None, None, details
 
     line_box = (
         min(x for x, _ in line_pixels),
@@ -322,6 +592,7 @@ def locate_candies_counter(crop):
     scale = width / 210
     visited = bytearray(width * height)
     components = []
+    component_reports = []
     min_area = max(6, round(scale * scale * 8))
     for y in range(line_top, line_bottom):
         for x in range(width):
@@ -342,12 +613,18 @@ def locate_candies_counter(crop):
                         if mask[next_index] and not visited[next_index]:
                             visited[next_index] = 1
                             stack.append((next_x, next_y))
-            if len(points) < min_area:
-                continue
             x0 = min(px for px, _ in points)
             x1 = max(px for px, _ in points) + 1
             y0 = min(py for _, py in points)
             y1 = max(py for _, py in points) + 1
+            if len(points) < min_area:
+                component_reports.append({
+                    'box': (x0, y0, x1, y1),
+                    'area': len(points),
+                    'retained': False,
+                    'discard_reason': f'area menor que {min_area}',
+                })
+                continue
             edge_rows = max(1, round((y1 - y0) * 0.2))
             top_x = [px for px, py in points if py < y0 + edge_rows]
             bottom_x = [px for px, py in points if py >= y1 - edge_rows]
@@ -355,10 +632,20 @@ def locate_candies_counter(crop):
                 sum(bottom_x) / len(bottom_x) - sum(top_x) / len(top_x)
                 if top_x and bottom_x else 0
             )
-            components.append({
+            component = {
                 'x0': x0, 'x1': x1, 'y0': y0, 'y1': y1,
-                'height': y1 - y0, 'slope': slope,
+                'height': y1 - y0, 'slope': slope, 'area': len(points),
+            }
+            components.append(component)
+            component_reports.append({
+                'box': (x0, y0, x1, y1),
+                'area': len(points),
+                'retained': True,
+                'height': y1 - y0,
+                'slope': round(slope, 2),
             })
+    details['components'] = component_reports
+    details['minimum_component_area'] = min_area
 
     line_height = max((component['height'] for component in components), default=0)
     edge_margin = max(2, round(scale * 2))
@@ -366,13 +653,25 @@ def locate_candies_counter(crop):
             line_box[1] <= edge_margin or
             line_box[2] >= width - edge_margin or
             line_box[3] >= height - edge_margin):
-        return 'unrecognized', line_box, None
+        details['stage'] = 'line_bounds'
+        details['detail'] = (
+            f'Linha detectada próxima da borda; margem exigida={edge_margin}px, '
+            f'caixa={line_box}, tamanho ROI={width}x{height}.'
+        )
+        return 'unrecognized', line_box, None, details
 
     separator_candidates = [
         component for component in components
         if component['x1'] - component['x0'] <= line_height * 0.65
         and component['height'] >= line_height * 0.75
         and abs(component['slope']) >= line_height * 0.23
+    ]
+    details['separator_candidates'] = [
+        {
+            'box': (item['x0'], item['y0'], item['x1'], item['y1']),
+            'slope': round(item['slope'], 2),
+        }
+        for item in separator_candidates
     ]
     layouts = []
     for separator in separator_candidates:
@@ -382,12 +681,24 @@ def locate_candies_counter(crop):
             and component['x1'] <= separator['x0'] + 1
         ]
         if not before:
+            details['layouts'].append({
+                'separator_x': separator['x0'],
+                'accepted': False,
+                'rejection': 'nenhum componente antes do candidato',
+            })
             continue
         number_left = min(component['x0'] for component in before)
         number_width = separator['x0'] - number_left
         if (number_left <= edge_margin or
                 number_width < line_height * 0.3 or
                 number_width > line_height * 2.5):
+            details['layouts'].append({
+                'separator_x': separator['x0'],
+                'accepted': False,
+                'rejection': 'largura/margem do numerador fora do limite',
+                'numerator_x_bounds': (number_left, separator['x0']),
+                'numerator_width': number_width,
+            })
             continue
 
         after = sorted(
@@ -402,12 +713,29 @@ def locate_candies_counter(crop):
                 break
             denominator.append(component)
         if not denominator:
+            details['layouts'].append({
+                'separator_x': separator['x0'],
+                'accepted': False,
+                'rejection': 'nenhum componente após o separador',
+            })
             continue
         denominator_width = (
             max(component['x1'] for component in denominator) -
             min(component['x0'] for component in denominator)
         )
         if not line_height * 1.5 <= denominator_width <= line_height * 2.7:
+            details['layouts'].append({
+                'separator_x': separator['x0'],
+                'accepted': False,
+                'rejection': 'largura do denominador fora do limite',
+                'denominator_box': (
+                    min(component['x0'] for component in denominator),
+                    min(component['y0'] for component in denominator),
+                    max(component['x1'] for component in denominator),
+                    max(component['y1'] for component in denominator),
+                ),
+                'denominator_width': denominator_width,
+            })
             continue
         number_top = min(component['y0'] for component in before)
         number_bottom = max(component['y1'] for component in before)
@@ -418,9 +746,27 @@ def locate_candies_counter(crop):
             number_top,
             number_bottom,
         ))
+        details['layouts'].append({
+            'separator_x': separator['x0'],
+            'accepted': True,
+            'numerator_box': (
+                number_left, number_top, separator['x0'], number_bottom
+            ),
+            'denominator_width': denominator_width,
+        })
 
     if len(layouts) != 1:
-        return 'unrecognized', line_box, None
+        if len(layouts) > 1:
+            details['stage'] = 'separator_ambiguity'
+        elif not separator_candidates:
+            details['stage'] = 'separator_not_found'
+        else:
+            details['stage'] = 'layout_not_valid'
+        details['detail'] = (
+            f'Esperado exatamente um layout numerador/separador/denominador; '
+            f'{len(layouts)} layouts passaram pela geometria.'
+        )
+        return 'unrecognized', line_box, None, details
 
     separator, number_left, _, number_top, number_bottom = layouts[0]
     padding = max(1, round(line_height * 0.18))
@@ -430,108 +776,259 @@ def locate_candies_counter(crop):
         separator['x0'],
         min(height, number_bottom + padding),
     )
-    return 'recognized', line_box, numerator_box
+    details['stage'] = 'recognized'
+    details['detail'] = 'Um único layout geométrico passou pelas verificações.'
+    return 'recognized', line_box, numerator_box, details
 
 
-def analyze_candies(screenshot_image, region=None, *, tesseract_error=None):
+def analyze_candies(screenshot_image, region=None):
+    with CANDIES_OPERATION_LOCK:
+        return _analyze_candies_locked(screenshot_image, region)
+
+
+def _analyze_candies_locked(screenshot_image, region=None):
     region = region or ROIS['candies']
     try:
         crop_box = roi_box(screenshot_image, region)
     except ValueError as exc:
         return CandiesOCRResult(None, (), (), 'invalid_region', None, None, str(exc))
 
-    crop = screenshot_image.crop(crop_box).convert('RGB')
-    if crop.width < 16 or crop.height < 8:
-        return CandiesOCRResult(
-            None, (), (), 'invalid_region', crop_box, None,
-            f'Recorte insuficiente para OCR: {crop.width}x{crop.height}.'
-        )
-
-    visibility, local_counter_box, local_numerator_box = locate_candies_counter(crop)
-    counter_box = (
-        (crop_box[0] + local_counter_box[0],
-         crop_box[1] + local_counter_box[1],
-         crop_box[0] + local_counter_box[2],
-         crop_box[1] + local_counter_box[3])
-        if local_counter_box else None
-    )
-    numerator_box = (
-        (crop_box[0] + local_numerator_box[0],
-         crop_box[1] + local_numerator_box[1],
-         crop_box[0] + local_numerator_box[2],
-         crop_box[1] + local_numerator_box[3])
-        if local_numerator_box else None
-    )
-    if visibility == 'not_visible':
-        return CandiesOCRResult(
-            None, (), (), 'not_visible', crop_box, None,
-            counter_box=counter_box,
-        )
-    if visibility != 'recognized' or local_numerator_box is None:
-        return CandiesOCRResult(
-            None, (), (), 'unrecognized', crop_box, None,
-            'Contador laranja incompleto ou sem separador visual confiável.',
-            counter_box, numerator_box,
-        )
-
-    numerator = crop.crop(local_numerator_box)
-    scaled = numerator.resize(
-        (numerator.width * 6, numerator.height * 6), Image.Resampling.LANCZOS
-    )
-    prepared = ImageOps.autocontrast(scaled.getchannel('R'))
-    if tesseract_error:
-        return CandiesOCRResult(
-            None, (), (), 'tesseract_unavailable', crop_box, prepared,
-            tesseract_error, counter_box, numerator_box,
-        )
-
-    raw_texts = []
-    candidates = []
-    for psm in (7, 8):
-        try:
-            raw = pytesseract.image_to_string(
-                prepared,
-                config=f'--psm {psm} -c tessedit_char_whitelist=0123456789',
-                timeout=2.5,
-            )
-        except pytesseract.pytesseract.TesseractNotFoundError as exc:
+    try:
+        crop = screenshot_image.crop(crop_box).convert('RGB')
+        if crop.width < 16 or crop.height < 8:
             return CandiesOCRResult(
-                None, tuple(candidates), tuple(raw_texts), 'tesseract_unavailable',
-                crop_box, prepared, str(exc), counter_box, numerator_box,
+                None, (), (), 'invalid_region', crop_box, None,
+                f'Recorte insuficiente para OCR: {crop.width}x{crop.height}.'
             )
-        except OSError as exc:
-            return CandiesOCRResult(
-                None, tuple(candidates), tuple(raw_texts), 'tesseract_unavailable',
-                crop_box, prepared, str(exc), counter_box, numerator_box,
-            )
-        except RuntimeError as exc:
-            return CandiesOCRResult(
-                None, tuple(candidates), tuple(raw_texts), 'ocr_error',
-                crop_box, prepared, str(exc), counter_box, numerator_box,
-            )
-        raw_texts.append(raw.strip())
-        if re.fullmatch(r'\d{1,3}', raw.strip()):
-            number = int(raw.strip())
-            if 0 <= number <= 500:
-                candidates.append(number)
 
-    distinct = set(candidates)
-    if len(distinct) == 1:
-        value = distinct.pop()
-        return CandiesOCRResult(
-            value, tuple(candidates), tuple(raw_texts), 'recognized', crop_box,
-            prepared, counter_box=counter_box, numerator_box=numerator_box,
+        visibility, local_counter_box, local_numerator_box, locator_trace = (
+            locate_candies_counter(crop)
         )
-    if len(distinct) > 1:
-        return CandiesOCRResult(
-            None, tuple(candidates), tuple(raw_texts), 'divergent', crop_box,
-            prepared, f'Variantes OCR divergentes: {sorted(distinct)}.',
-            counter_box, numerator_box,
+        counter_box = (
+            (crop_box[0] + local_counter_box[0],
+             crop_box[1] + local_counter_box[1],
+             crop_box[0] + local_counter_box[2],
+             crop_box[1] + local_counter_box[3])
+            if local_counter_box else None
         )
+        numerator_box = (
+            (crop_box[0] + local_numerator_box[0],
+             crop_box[1] + local_numerator_box[1],
+             crop_box[0] + local_numerator_box[2],
+             crop_box[1] + local_numerator_box[3])
+            if local_numerator_box else None
+        )
+        components = tuple(locator_trace['components'])
+        rejection_stage = locator_trace['stage']
+        rejection_detail = locator_trace['detail']
+        if visibility == 'not_visible':
+            return CandiesOCRResult(
+                None, (), (), 'not_visible', crop_box, None,
+                counter_box=counter_box, rejection_stage=rejection_stage,
+                rejection_detail=rejection_detail, components=components,
+                locator_trace=locator_trace,
+            )
+        if local_counter_box is None:
+            return CandiesOCRResult(
+                None, (), (), 'inconclusive', crop_box, None,
+                'Não foi possível formar a caixa visual completa do contador.',
+                counter_box, numerator_box, rejection_stage=rejection_stage,
+                rejection_detail=rejection_detail, components=components,
+                locator_trace=locator_trace,
+            )
+
+        if local_numerator_box is not None:
+            numerator = crop.crop(local_numerator_box)
+            scaled = numerator.resize(
+                (numerator.width * 6, numerator.height * 6),
+                Image.Resampling.LANCZOS,
+            )
+            prepared = ImageOps.autocontrast(scaled.getchannel('R'))
+            ocr_crop_box = numerator_box
+        else:
+            if locator_trace['stage'] == 'line_bounds':
+                return CandiesOCRResult(
+                    None, (), (), 'inconclusive', crop_box, None,
+                    'Contador visível, mas a linha está junto à borda da calibração.',
+                    counter_box, None, rejection_stage=rejection_stage,
+                    rejection_detail=rejection_detail, components=components,
+                    locator_trace=locator_trace,
+                )
+            prepared = None
+            ocr_crop_box = None
+    except Exception as exc:
+        return technical_ocr_result(
+            'ocr_error', 'image_preprocessing', exc, crop_box=crop_box
+        )
+
+    primary_raw = []
+    primary_candidates = []
+    primary_malformed = []
+    primary_inconclusive = []
+    failures = []
+    if prepared is not None:
+        layout = (locator_trace.get('layouts') or [{}])[0]
+        geometric_numerator = layout.get('numerator_box')
+        minimum_digits = 1
+        if geometric_numerator:
+            width = geometric_numerator[2] - geometric_numerator[0]
+            height = max(1, geometric_numerator[3] - geometric_numerator[1])
+            # A very short OCR string cannot explain the full visible glyph
+            # span. Treat it as incomplete rather than as a second value.
+            minimum_digits = max(
+                1, min(3, math.ceil((width / height + 0.15) / 1.10))
+            )
+        (primary_raw, primary_candidates, primary_malformed,
+         primary_inconclusive, failures, terminal) = run_tesseract_variants(
+            prepared, '0123456789', 'numerator_tesseract', crop_box=crop_box,
+            counter_box=counter_box, numerator_box=numerator_box,
+            rejection_stage=rejection_stage, rejection_detail=rejection_detail,
+            components=components, locator_trace=locator_trace,
+            minimum_digits=minimum_digits,
+            parse_candidate=lambda text: (
+                int(text) if re.fullmatch(r'\d{1,3}', text)
+                and 0 <= int(text) <= 500 else None
+            ),
+        )
+        if terminal is not None:
+            return replace(
+                terminal,
+                candidatos_validos=tuple(
+                    ('numerador_geometrico', value)
+                    for value in primary_candidates
+                ),
+                leituras_malformadas=tuple(
+                    ('numerador_geometrico', text)
+                    for text in primary_malformed
+                ),
+                leituras_inconclusivas=tuple(
+                    ('numerador_geometrico', text)
+                    for text in primary_inconclusive
+                ),
+                motivo_decisao='Falha técnica antes da validação final das rotas.',
+            )
+
+    if locator_trace['stage'] == 'line_bounds':
+        return CandiesOCRResult(
+            None, tuple(primary_candidates), tuple(primary_raw), 'inconclusive',
+            crop_box, prepared, 'A segmentação indica possível corte pela borda do ROI.',
+            counter_box, numerator_box, tuple(failures), rejection_stage,
+            rejection_detail, components, ocr_crop_box, (), locator_trace,
+            tuple(('numerador_geometrico', value) for value in primary_candidates),
+            tuple(('numerador_geometrico', text) for text in primary_malformed),
+            tuple(('numerador_geometrico', text) for text in primary_inconclusive),
+            (), 'Borda do ROI pode cortar dígitos; fallback bloqueado.',
+        )
+
+    line_box = local_counter_box
+    line_height = line_box[3] - line_box[1]
+    padding = max(2, round(line_height * 0.16))
+    line_crop_box = (
+        max(0, line_box[0] - padding),
+        max(0, line_box[1] - padding),
+        min(crop.width, line_box[2] + padding),
+        min(crop.height, line_box[3] + padding),
+    )
+    line_crop = crop.crop(line_crop_box).getchannel('R')
+    line_scaled = line_crop.resize(
+        (line_crop.width * 4, line_crop.height * 4), Image.Resampling.LANCZOS
+    )
+    fallback_prepared = ImageOps.autocontrast(line_scaled)
+    fallback_ocr_box = (
+        crop_box[0] + line_crop_box[0],
+        crop_box[1] + line_crop_box[1],
+        crop_box[0] + line_crop_box[2],
+        crop_box[1] + line_crop_box[3],
+    )
+    fallback_stage = 'separator_fallback' if prepared is None else 'counter_fallback'
+    (fallback_raw, fallback_candidates, fallback_malformed,
+     fallback_inconclusive, fallback_failures, terminal) = run_tesseract_variants(
+            fallback_prepared, '0123456789/', fallback_stage,
+            crop_box=crop_box, counter_box=counter_box,
+            numerator_box=numerator_box, rejection_stage=rejection_stage,
+            rejection_detail=rejection_detail, components=components,
+            locator_trace=locator_trace, fallback_crop_box=fallback_ocr_box,
+            parse_candidate=lambda text: (
+                int(match.group(1))
+                if (match := re.fullmatch(r'\s*(\d{1,3})\s*/\s*500\s*', text))
+                and 0 <= int(match.group(1)) <= 500 else None
+            ),
+        )
+    if terminal is not None:
+        return replace(
+            terminal, raw_texts=tuple(primary_raw),
+            candidates=tuple(primary_candidates) + terminal.candidates,
+            fallback_raw_texts=tuple(fallback_raw),
+            candidatos_validos=tuple(
+                [('numerador_geometrico', value) for value in primary_candidates] +
+                [('linha_completa_500', value) for value in fallback_candidates]
+            ),
+            leituras_malformadas=tuple(
+                [('numerador_geometrico', text) for text in primary_malformed] +
+                [('linha_completa_500', text) for text in fallback_malformed]
+            ),
+            leituras_inconclusivas=tuple(
+                [('numerador_geometrico', text) for text in primary_inconclusive] +
+                [('linha_completa_500', text) for text in fallback_inconclusive]
+            ),
+            motivo_decisao='Falha técnica durante OCR da linha completa.',
+        )
+
+    all_candidates = tuple(primary_candidates + fallback_candidates)
+    all_distinct = set(all_candidates)
+    valid_records = tuple(
+        [('numerador_geometrico', value) for value in primary_candidates] +
+        [('linha_completa_500', value) for value in fallback_candidates]
+    )
+    malformed_records = tuple(
+        [('numerador_geometrico', text) for text in primary_malformed] +
+        [('linha_completa_500', text) for text in fallback_malformed]
+    )
+    inconclusive_records = tuple(
+        [('numerador_geometrico', text) for text in primary_inconclusive] +
+        [('linha_completa_500', text) for text in fallback_inconclusive]
+    )
+    if len(all_distinct) > 1:
+        reason = 'divergent'
+        contradictions = tuple(sorted(all_distinct))
+        decision = (
+            'Candidatos completos e válidos discordam entre si: '
+            f'{list(contradictions)}; leitura bloqueada.'
+        )
+        rejection_stage = 'candidate_conflict'
+        rejection_detail = decision
+        error = decision
+        value = None
+    elif len(all_candidates) >= 2:
+        reason = 'recognized'
+        contradictions = ()
+        value = all_candidates[0]
+        decision = (
+            f'{len(all_candidates)} candidatos completos e válidos concordam '
+            f'em {value}; leituras malformadas não foram usadas como evidência.'
+        )
+        rejection_stage = 'recognized'
+        rejection_detail = decision
+        error = None
+    else:
+        reason = 'inconclusive'
+        contradictions = ()
+        value = None
+        decision = (
+            'Menos de dois candidatos completos e válidos concordantes; '
+            'não há evidência suficiente para confirmar o numerador.'
+        )
+        rejection_stage = 'insufficient_valid_candidates'
+        rejection_detail = decision
+        error = decision
 
     return CandiesOCRResult(
-        None, (), tuple(raw_texts), 'unrecognized', crop_box, prepared,
-        counter_box=counter_box, numerator_box=numerator_box,
+        value, all_candidates, tuple(primary_raw), reason, crop_box,
+        fallback_prepared, error, counter_box, numerator_box,
+        tuple(failures + fallback_failures), rejection_stage, rejection_detail,
+        components, fallback_ocr_box, tuple(fallback_raw), locator_trace,
+        valid_records, malformed_records, inconclusive_records,
+        contradictions, decision,
     )
 
 
@@ -542,12 +1039,23 @@ def read_candies(screenshot_image, region=None, return_candidates=False):
     return result.value
 
 
+def accumulate_analysis_result(result, captured_at, readings, interpretations):
+    """Adds only confirmed samples and valid contradictions from this analysis."""
+    interpretations.extend(result.contradicoes)
+    if result.value is None:
+        return False
+    readings.append((captured_at, result.value))
+    return True
+
+
 OCR_REASON_LABELS = {
     'recognized': 'OCR reconhecido',
     'not_visible': 'Contador não visível',
     'invalid_region': 'Região de captura inválida',
     'unrecognized': 'Texto não reconhecido',
+    'inconclusive': 'OCR inconclusivo',
     'tesseract_unavailable': 'Tesseract indisponível',
+    'ocr_timeout': 'Tempo limite do OCR excedido',
     'divergent': 'OCR reconhecido, mas rejeitado por divergência',
     'capture_failed': 'Falha inesperada de captura',
     'ocr_error': 'Falha inesperada do OCR',
@@ -604,6 +1112,10 @@ def save_candies_diagnostic(shot, cfg, result=None, *, reason=None, error=None,
                 shot.crop(result.counter_box).save(folder / 'contador_localizado.png')
             if result and result.numerator_box:
                 shot.crop(result.numerator_box).save(folder / 'numerador.png')
+            if result and result.ocr_crop_box:
+                shot.crop(result.ocr_crop_box).save(
+                    folder / 'recorte_enviado_tesseract.png'
+                )
             annotated = shot.copy()
             draw = ImageDraw.Draw(annotated)
             draw.rectangle(
@@ -621,6 +1133,12 @@ def save_candies_diagnostic(shot, cfg, result=None, *, reason=None, error=None,
                     (result.numerator_box[0], result.numerator_box[1],
                      result.numerator_box[2] - 1, result.numerator_box[3] - 1),
                     outline=(255, 255, 0), width=max(2, round(shot.width / 700))
+                )
+            if result and result.ocr_crop_box:
+                draw.rectangle(
+                    (result.ocr_crop_box[0], result.ocr_crop_box[1],
+                     result.ocr_crop_box[2] - 1, result.ocr_crop_box[3] - 1),
+                    outline=(255, 0, 255), width=max(2, round(shot.width / 700))
                 )
             annotated.save(folder / 'regiao_analisada.png')
         if client_bbox:
@@ -642,7 +1160,13 @@ def save_candies_diagnostic(shot, cfg, result=None, *, reason=None, error=None,
         f'Resultado: {OCR_REASON_LABELS.get(selected_reason, selected_reason)}',
         f'Valor reconhecido: {value if value is not None else "nenhum"}',
         f'Variantes numéricas válidas: {list(candidates)}',
+        f'Candidatos válidos por caminho: {json.dumps(result.candidatos_validos if result else (), ensure_ascii=False)}',
+        f'Leituras malformadas por caminho: {json.dumps(result.leituras_malformadas if result else (), ensure_ascii=False)}',
+        f'Leituras inconclusivas por caminho: {json.dumps(result.leituras_inconclusivas if result else (), ensure_ascii=False)}',
+        f'Contradições válidas: {list(result.contradicoes if result else ())}',
+        f'Decisão final: {result.motivo_decisao if result and result.motivo_decisao else "não determinada"}',
         f'OCR bruto por variante: {list(raw_texts)!r}',
+        f'OCR bruto do fallback /500: {list(result.fallback_raw_texts if result else ())!r}',
         f'Motivo/erro: {error or (result.error if result else None) or region_error or "nenhum"}',
         f'Resolução da captura: {f"{shot.width}x{shot.height}" if shot else "indisponível"}',
         f'Retângulo cliente na tela: {client_bbox or "indisponível"}',
@@ -652,9 +1176,24 @@ def save_candies_diagnostic(shot, cfg, result=None, *, reason=None, error=None,
         f'Recorte em pixels (imagem capturada): {crop_box or "indisponível"}',
         f'Contador localizado (pixels da captura): {result.counter_box if result and result.counter_box else "não identificado"}',
         f'Numerador isolado (pixels da captura): {result.numerator_box if result and result.numerator_box else "não identificado"}',
-        'Separador e denominador validados visualmente; o OCR recebe somente o numerador.',
+        f'Etapa de rejeição geométrica/OCR: {result.rejection_stage if result and result.rejection_stage else "nenhuma"}',
+        f'Detalhe da rejeição: {result.rejection_detail if result and result.rejection_detail else "nenhum"}',
+        f'Retângulo enviado ao Tesseract (pixels da captura): {result.ocr_crop_box if result and result.ocr_crop_box else "não identificado"}',
+        f'Componentes de cor: {json.dumps(result.components if result else (), ensure_ascii=False)}',
+        f'Traço do localizador: {json.dumps(result.locator_trace if result else None, ensure_ascii=False)}',
         f'Executável Tesseract: {pytesseract.pytesseract.tesseract_cmd}',
     ]
+    if result and result.failures:
+        for failure in result.failures:
+            lines.extend((
+                f'Etapa da exceção: {failure.stage}',
+                f'Tentativa: {failure.attempt}',
+                f'Tipo da exceção: {failure.exception_type}',
+                f'Mensagem da exceção: {failure.message}',
+                'Traceback completo:',
+                failure.traceback_text.rstrip(),
+                '---',
+            ))
     (folder / 'diagnostico.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
     prune_candies_diagnostics()
     return folder
@@ -764,34 +1303,35 @@ def locate_tesseract():
 
 
 def configure_tesseract(cfg):
-    configured = str(cfg.get('tesseract', '') or '').strip()
-    discovered = locate_tesseract()
-    candidates = []
-    if configured and Path(configured).is_file():
-        candidates.append(configured)
-    if discovered and discovered not in candidates:
-        candidates.append(discovered)
-    if not candidates:
-        pytesseract.pytesseract.tesseract_cmd = 'tesseract'
-        raise RuntimeError(
-            'Tesseract OCR não encontrado. Instale o Tesseract ou configure o caminho '
-            'do tesseract.exe em config.json.'
-        )
+    with CANDIES_OPERATION_LOCK:
+        configured = str(cfg.get('tesseract', '') or '').strip()
+        discovered = locate_tesseract()
+        candidates = []
+        if configured and Path(configured).is_file():
+            candidates.append(configured)
+        if discovered and discovered not in candidates:
+            candidates.append(discovered)
+        if not candidates:
+            pytesseract.pytesseract.tesseract_cmd = 'tesseract'
+            raise RuntimeError(
+                'Tesseract OCR não encontrado. Instale o Tesseract ou configure o caminho '
+                'do tesseract.exe em config.json.'
+            )
 
-    errors = []
-    for engine in candidates:
-        pytesseract.pytesseract.tesseract_cmd = str(engine)
-        try:
-            version = pytesseract.get_tesseract_version()
-        except (pytesseract.pytesseract.TesseractNotFoundError, OSError, RuntimeError) as exc:
-            errors.append(f'{engine}: {exc}')
-            continue
-        warning = None
-        if configured and engine != configured:
-            warning = f'O caminho Tesseract salvo não está disponível; usando a instalação encontrada em {engine}.'
-        return str(engine), str(version), warning
+        errors = []
+        for engine in candidates:
+            pytesseract.pytesseract.tesseract_cmd = str(engine)
+            try:
+                version = pytesseract.get_tesseract_version()
+            except (pytesseract.pytesseract.TesseractNotFoundError, OSError, RuntimeError) as exc:
+                errors.append(f'{engine}: {exc}')
+                continue
+            warning = None
+            if configured and engine != configured:
+                warning = f'O caminho Tesseract salvo não está disponível; usando a instalação encontrada em {engine}.'
+            return str(engine), str(version), warning
 
-    raise RuntimeError('Tesseract encontrado, mas não pôde ser executado: ' + '; '.join(errors))
+        raise RuntimeError('Tesseract encontrado, mas não pôde ser executado: ' + '; '.join(errors))
 
 
 def boss_status(server_seconds):
@@ -905,7 +1445,6 @@ class Controller:
                     result = None
                     candy_region = None
                     try:
-                        shot, capture_bbox = screenshot_with_bbox()
                         try:
                             candy_region = region_from(self.cfg, 'candies')
                         except ValueError as exc:
@@ -913,16 +1452,19 @@ class Controller:
                                 None, (), (), 'invalid_region', None, None, str(exc)
                             )
                         else:
-                            try:
-                                result = analyze_candies(shot, candy_region)
-                            except Exception as exc:
-                                result = CandiesOCRResult(
-                                    None, (), (), 'ocr_error', None, None, str(exc)
-                                )
-                        interpretacoes_brutas.extend(result.candidates)
+                            shot, capture_bbox, result = capture_candies_attempt(
+                                candy_region
+                            )
+                        report_ocr_failures(
+                            result, f'análise automática, tentativa {ocr_attempts[0]}',
+                            self.emit,
+                        )
+                        # Falhas e amostras inconclusivas não contam como leituras.
+                        accumulate_analysis_result(
+                            result, time.monotonic(), readings, interpretacoes_brutas
+                        )
                         value = result.value
                         if value is not None:
-                            readings.append((time.monotonic(), value))
                             latest_valid_shot[0] = shot
                             if value not in audit_by_value and len(audit_by_value) < 5:
                                 audit_by_value[value] = (
@@ -939,19 +1481,22 @@ class Controller:
                                     shot, result, result.reason, result.error,
                                     capture_bbox, candy_region
                                 ))
-                            if result.reason in ('invalid_region', 'tesseract_unavailable'):
-                                break
                     except Exception as exc:
                         reason = 'capture_failed' if shot is None else 'ocr_error'
+                        result = technical_ocr_result(
+                            reason, 'candies_analysis', exc, shot=shot,
+                            attempt=ocr_attempts[0],
+                        )
+                        report_ocr_failures(
+                            result, f'análise automática, tentativa {ocr_attempts[0]}',
+                            self.emit,
+                        )
                         failure_counts[reason] += 1
                         if reason not in sampled_reasons and len(diagnostic_samples) < 2:
                             sampled_reasons.add(reason)
                             diagnostic_samples.append((
-                                shot,
-                                CandiesOCRResult(
-                                    None, (), (), reason, None, None, str(exc)
-                                ) if shot is not None else None,
-                                reason, str(exc), capture_bbox, candy_region
+                                shot, result, reason, str(exc), capture_bbox,
+                                candy_region
                             ))
                     next_read = time.monotonic() + max(0.7, float(self.cfg['intervalo_ocr']))
             finally:
@@ -1181,7 +1726,7 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title('GPO_AutoFarm_v11')
-        self.root.geometry('910x675')
+        self.root.geometry('910x643')
         self.root.minsize(790,520)
         self.data = load()
         self.events = queue.Queue()
@@ -1231,8 +1776,13 @@ class App:
         automation_tab = ttk.Frame(tabs)
         canvas = tk.Canvas(automation_tab, highlightthickness=0, borderwidth=0)
         automation_scroll = ttk.Scrollbar(automation_tab, orient='vertical', command=canvas.yview)
-        canvas.configure(yscrollcommand=automation_scroll.set)
-        automation_scroll.pack(side='right', fill='y')
+        def update_automation_scrollbar(first, last):
+            if float(first) <= 0 and float(last) >= 1:
+                automation_scroll.pack_forget()
+            elif not automation_scroll.winfo_manager():
+                automation_scroll.pack(side='right', fill='y')
+
+        canvas.configure(yscrollcommand=update_automation_scrollbar)
         canvas.pack(side='left', fill='both', expand=True)
         principal = ttk.Frame(canvas, padding=12)
         canvas_window = canvas.create_window((0, 0), window=principal, anchor='nw')
@@ -1568,11 +2118,11 @@ class App:
             capture_bbox = None
             result = None
             folder = None
+            stage = 'roblox_focus'
             try:
                 time.sleep(0.65)
                 activate_roblox_window()
-                shot, capture_bbox = screenshot_with_bbox()
-                self.events.put(('log', f'Área interna do Roblox: {shot.width}x{shot.height} px (sem barra de título/tarefas).'))
+                stage = 'candies_region'
                 try:
                     candy_region = region_from(self.data, 'candies')
                 except ValueError as exc:
@@ -1580,16 +2130,25 @@ class App:
                         None, (), (), 'invalid_region', None, None, str(exc)
                     )
                 else:
+                    stage = 'tesseract_setup'
                     try:
                         engine, version, warning = configure_tesseract(self.data)
+                    except RuntimeError as exc:
+                        result = technical_ocr_result(
+                            'tesseract_unavailable', stage, exc
+                        )
+                    else:
                         if warning:
                             self.events.put(('log', warning))
                         self.events.put(('log', f'Tesseract confirmado: {engine} (versão {version}).'))
-                        result = analyze_candies(shot, candy_region)
-                    except RuntimeError as exc:
-                        result = analyze_candies(
-                            shot, candy_region, tesseract_error=str(exc)
+                        stage = 'screen_capture'
+                        shot, capture_bbox, result = capture_candies_attempt(
+                            candy_region
                         )
+                        if shot is not None:
+                            self.events.put(('log', f'Área interna do Roblox: {shot.width}x{shot.height} px (sem barra de título/tarefas).'))
+                        stage = 'image_to_text'
+                report_ocr_failures(result, 'teste manual', self.events.put)
                 folder = save_candies_diagnostic(
                     shot, self.data, result, client_bbox=capture_bbox
                 )
@@ -1603,13 +2162,23 @@ class App:
                     f'Leitura {"válida" if result.value is not None else "inconclusiva"}\n'
                     f'Numerador: {result.value if result.value is not None else "não identificado"}\n'
                     f'Região da captura: {result.crop_box or "não identificada"}\n\n'
+                    f'Etapa: {result.rejection_stage or "nenhuma"}\n'
+                    f'Detalhe: {result.rejection_detail or "nenhum"}\n'
+                    f'Recorte enviado ao Tesseract: '
+                    f'{result.ocr_crop_box or "não identificado"}\n'
+                    f'Candidatos válidos por caminho: {result.candidatos_validos}\n'
+                    f'Leituras malformadas: {result.leituras_malformadas}\n'
+                    f'Contradições válidas: {result.contradicoes}\n'
+                    f'Decisão: {result.motivo_decisao or "não determinada"}\n'
+                    f'Leituras fallback /500: {result.fallback_raw_texts}\n\n'
                     f'Diagnóstico visual: {folder}'
                 )
             except Exception as e:
-                reason = 'capture_failed' if shot is None else 'ocr_error'
-                result = CandiesOCRResult(
-                    None, (), (), reason, None, None, str(e)
-                ) if shot is not None else None
+                reason = 'capture_failed' if stage == 'screen_capture' else 'ocr_error'
+                result = technical_ocr_result(
+                    reason, stage, e, shot=shot,
+                )
+                report_ocr_failures(result, 'teste manual', self.events.put)
                 try:
                     folder = save_candies_diagnostic(
                         shot, self.data, result, reason=reason,
@@ -1668,6 +2237,14 @@ class App:
                     result.numerator_box[3] - roi_top,
                 )
                 draw.rectangle(box, outline=(255, 255, 0), width=2)
+            if result.ocr_crop_box:
+                box = (
+                    result.ocr_crop_box[0] - roi_left,
+                    result.ocr_crop_box[1] - roi_top,
+                    result.ocr_crop_box[2] - roi_left,
+                    result.ocr_crop_box[3] - roi_top,
+                )
+                draw.rectangle(box, outline=(255, 0, 255), width=2)
             preview_scale = min(640 / preview.width, 240 / preview.height, 6)
             preview = preview.resize(
                 (max(1, round(preview.width * preview_scale)),
@@ -1677,9 +2254,26 @@ class App:
             win._region_photo = ImageTk.PhotoImage(preview)
             ttk.Label(
                 win,
-                text='Região analisada (verde: contador; amarelo: numerador)',
+                text='Região analisada (verde: contador; amarelo: numerador; roxo: OCR)',
             ).pack(anchor='w', padx=14)
             ttk.Label(win, image=win._region_photo).pack(padx=14, pady=(4, 8))
+            if result.ocr_crop_box and result.ocr_crop_box != result.numerator_box:
+                sent_crop = shot.crop(result.ocr_crop_box)
+                crop_scale = min(
+                    480 / sent_crop.width, 120 / sent_crop.height, 6
+                )
+                sent_crop = sent_crop.resize(
+                    (max(1, round(sent_crop.width * crop_scale)),
+                     max(1, round(sent_crop.height * crop_scale))),
+                    Image.Resampling.LANCZOS,
+                )
+                win._ocr_crop_photo = ImageTk.PhotoImage(sent_crop)
+                ttk.Label(
+                    win, text='Recorte efetivamente enviado ao Tesseract:'
+                ).pack(anchor='w', padx=14)
+                ttk.Label(win, image=win._ocr_crop_photo).pack(
+                    padx=14, pady=(4, 8)
+                )
             if result.numerator_box:
                 numerator = shot.crop(result.numerator_box)
                 numerator_scale = min(

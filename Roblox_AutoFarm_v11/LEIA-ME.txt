@@ -3,13 +3,36 @@ GPO_AutoFarm_v11 — CORREÇÃO DO OCR DOS CANDIES
 
 A captura padrão dos Candies agora cobre a região (580, 535, 790, 610) da
 área cliente do Roblox. O contador é localizado pela aparência laranja e pela
-geometria da barra; somente o numerador é enviado ao Tesseract. Recortes
-parciais ou escalas sem detalhe suficiente ficam inconclusivos.
+geometria da barra. A calibração serve como região de busca; os recortes são
+derivados dos limites visuais detectados. Se a geometria do numerador for
+ambígua, uma rota alternativa lê a linha completa e somente aceita duas
+leituras válidas e concordantes entre os caminhos disponíveis; a rota da
+linha completa exige o formato integral n/500. Numerador contraditório,
+denominador incompleto (/00) ou borda cortada continuam bloqueando a leitura.
+
+As rotas OCR separam candidatos válidos, texto malformado, leituras
+inconclusivas e contradições. A largura geométrica impede que uma leitura
+curta como "09" seja tratada como completa quando a caixa visível comporta
+três dígitos. Um texto como "500/0" é malformado e não vira valor nem
+contradição. Dois candidatos completos válidos diferentes bloqueiam a leitura.
 
 Testar OCR só fica disponível com automação e gravação paradas. O teste mostra
 a região analisada e o numerador isolado, sem reproduzir entradas ou alterar
 o item equipado. Os diagnósticos ficam em diagnostico/ e incluem imagens do
-contador localizado e do numerador.
+contador localizado, componentes segmentados e recorte realmente enviado ao
+Tesseract. O teste também informa a etapa geométrica rejeitada e as leituras
+brutas das duas rotas.
+
+Falhas do Tesseract e da captura são classificadas sem interromper a
+reprodução. Somente timeouts do Tesseract e erros de captura OSError com
+códigos transitórios reconhecidos recebem uma nova tentativa limitada; erros
+permanentes ou não classificados não são repetidos. Falhas e tentativas não
+reconhecidas não contam como leituras válidas. A captura e o OCR são
+serializados na thread de análise, sem bloquear a thread que reproduz o .rec.
+Tipo, etapa, mensagem e traceback
+completo são gravados em diagnostico/ocr_exceptions.log e no diagnostico.txt
+da captura associada. A causa interna do timeout registrado em diagnósticos
+anteriores não pode ser recuperada: eles não contêm o traceback da execução.
 
 As regras de compra seguem conservadoras: mínimo de 250 Candies, pelo menos
 cinco leituras concordantes em instantes distintos, ausência de contradições,
@@ -17,6 +40,7 @@ leitura recente, boss ausente, relógio manual sincronizado e margem suficiente
 antes do spawn. Os arquivos .rec e sua reprodução não foram alterados.
 
 Implementação: main.py (locate_candies_counter, analyze_candies,
+run_tesseract_variants, capture_candies_attempt, write_ocr_exception_log,
 save_candies_diagnostic, App.test_ocr e App._show_ocr_test_result),
 seguranca_candies.py (avaliar_leituras) e seus testes.
 
