@@ -1,7 +1,16 @@
 import unittest
+import json
 from pathlib import Path
+from gravacao_geometria import carregar_geometria, caminho_metadados
 from relogio_manual import RelogioManual
-from recplayer import read_rec
+from recplayer import (
+    RECORD,
+    SUPPORTED,
+    WM_KEYDOWN,
+    WM_SYSKEYDOWN,
+    is_record_stop_key,
+    read_rec,
+)
 
 class TestRelogioManual(unittest.TestCase):
     def setUp(self):
@@ -54,16 +63,55 @@ class TestRelogioManual(unittest.TestCase):
 
     def test_gravacoes_originais_completas(self):
         base = Path(__file__).parent / 'gravacoes'
-        esperado = {
-            'gravacao_coleta_1.rec': (89, 161.750),
-            'gravacao_analise_2.rec': (5, 46.796),
-            'gravacao_compra_3.rec': (193, 14.546),
-        }
-        for nome, (qtd, dur) in esperado.items():
+        nomes = (
+            'gravacao_coleta_1.rec',
+            'gravacao_analise_2.rec',
+            'gravacao_compra_3.rec',
+        )
+        for nome in nomes:
             with self.subTest(nome=nome):
-                ev = read_rec(base / nome)
-                self.assertEqual(len(ev), qtd)
-                self.assertAlmostEqual(ev[-1].offset, dur, places=3)
+                path = base / nome
+                raw = path.read_bytes()
+                self.assertTrue(raw)
+                self.assertEqual(len(raw) % RECORD.size, 0)
+                records = list(RECORD.iter_unpack(raw))
+                self.assertTrue(all(row[0] in SUPPORTED for row in records))
+
+                timestamps = [row[3] for row in records]
+                self.assertTrue(all(
+                    later >= earlier
+                    for earlier, later in zip(timestamps, timestamps[1:])
+                ))
+                self.assertLessEqual(
+                    timestamps[-1] - timestamps[0], 60 * 60 * 1000
+                )
+
+                events = read_rec(path)
+                self.assertEqual(len(events), len(records))
+                self.assertEqual(events[0].offset, 0)
+                self.assertTrue(all(
+                    later.offset >= earlier.offset
+                    for earlier, later in zip(events, events[1:])
+                ))
+                duration = (timestamps[-1] - timestamps[0]) / 1000
+                self.assertAlmostEqual(events[-1].offset, duration, places=6)
+                self.assertTrue(is_record_stop_key(events, len(events) - 1))
+                self.assertIn(
+                    events[-1].message, (WM_KEYDOWN, WM_SYSKEYDOWN)
+                )
+
+                if nome == 'gravacao_compra_3.rec':
+                    metadata_path = caminho_metadados(path)
+                    self.assertTrue(metadata_path.is_file())
+                    metadata = json.loads(
+                        metadata_path.read_text(encoding='utf-8')
+                    )
+                    self.assertEqual(metadata['versao'], 1)
+                    geometry = carregar_geometria(path)
+                    self.assertIsNotNone(geometry)
+                    self.assertEqual(
+                        tuple(metadata['area_cliente_tela']), geometry
+                    )
 
 if __name__ == '__main__':
     unittest.main()

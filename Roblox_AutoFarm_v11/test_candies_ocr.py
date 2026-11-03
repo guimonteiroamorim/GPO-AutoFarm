@@ -1,4 +1,5 @@
 import errno
+import os
 import tempfile
 import threading
 import time
@@ -565,15 +566,62 @@ class TestCandiesOCR(unittest.TestCase):
         self.assertEqual(maximum_active[0], 1)
 
     def test_caminho_tesseract_salvo_invalido_usa_instalacao_detectada(self):
-        with patch.object(main, 'locate_tesseract', return_value=r'C:\Tesseract\tesseract.exe'), \
-                patch.object(main.pytesseract, 'get_tesseract_version', return_value='5.4.0'), \
-                patch.object(main.pytesseract.pytesseract, 'tesseract_cmd', 'tesseract'):
-            engine, version, warning = main.configure_tesseract({
-                'tesseract': r'C:\antigo\tesseract.exe'
-            })
-        self.assertEqual(engine, r'C:\Tesseract\tesseract.exe')
+        with tempfile.TemporaryDirectory() as temp:
+            engine_path = Path(temp) / 'tesseract.exe'
+            engine_path.touch()
+            with patch.dict(os.environ, {'TESSDATA_PREFIX': ''}), \
+                    patch.object(main, 'locate_tesseract', return_value=str(engine_path)), \
+                    patch.object(main, 'packaged_tesseract', return_value=None), \
+                    patch.object(
+                        main, 'locate_tessdata',
+                        return_value=Path(temp) / 'tessdata'
+                    ), \
+                    patch.object(main, 'verify_tesseract', return_value='5.4.0'), \
+                    patch.object(
+                        main.pytesseract.pytesseract, 'tesseract_cmd', 'tesseract'
+                    ):
+                engine, version, warning = main.configure_tesseract({
+                    'tesseract': r'C:\antigo\tesseract.exe'
+                })
+            self.assertEqual(engine, str(engine_path))
+            self.assertEqual(version, '5.4.0')
+            self.assertIn('não está disponível', warning)
+
+    def test_tesseract_empacotado_tem_prioridade_sobre_caminho_salvo_inexistente(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            engine = root / 'tesseract' / 'tesseract.exe'
+            tessdata = engine.parent / 'tessdata'
+            tessdata.mkdir(parents=True)
+            engine.touch()
+            (tessdata / 'eng.traineddata').touch()
+
+            with patch.dict(os.environ, {'TESSDATA_PREFIX': ''}), \
+                    patch.object(main, 'BUNDLE_ROOT', root), \
+                    patch.object(main, 'verify_tesseract', return_value='5.4.0'), \
+                    patch.object(
+                        main.pytesseract.pytesseract, 'tesseract_cmd', 'tesseract'
+                    ):
+                selected, version, warning = main.configure_tesseract({
+                    'tesseract': r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+                })
+
+        self.assertEqual(selected, str(engine))
         self.assertEqual(version, '5.4.0')
-        self.assertIn('não está disponível', warning)
+        self.assertIn('prioridade', warning)
+
+    def test_erro_identifica_dados_eng_ausentes_no_tesseract_empacotado(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            engine = root / 'tesseract' / 'tesseract.exe'
+            engine.parent.mkdir()
+            engine.touch()
+
+            with patch.dict(os.environ, {'TESSDATA_PREFIX': ''}), \
+                    patch.object(main, 'BUNDLE_ROOT', root), \
+                    patch.object(main, 'locate_tesseract', return_value=None):
+                with self.assertRaisesRegex(RuntimeError, 'eng.traineddata'):
+                    main.configure_tesseract({})
 
     def test_salva_captura_recorte_preparacao_e_metadados(self):
         frame = reference_frame()

@@ -4,5 +4,6 @@
   "compra": "gravacoes/gravacao_compra_3.rec",
   "hotkey": "f12",
   "record_hotkey": "f8",
-  "meta": 250
+  "meta": 250,
+  "rare_chests": 0
 }

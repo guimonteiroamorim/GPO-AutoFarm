@@ -1,0 +1,55 @@
+Tesseract OCR portatil para GPO_AutoFarm_v11
+============================================
+
+Runtime x64, versao 5.4.0.20240606, obtido da distribuicao para Windows
+mantida pela Biblioteca da Universidade de Mannheim (UB Mannheim). Esta e a
+mesma versao instalada no computador de desenvolvimento. O executavel e as
+DLLs foram copiados sem modificacoes do instalador oficial:
+
+https://github.com/UB-Mannheim/tesseract/releases/tag/v5.4.0.20240606
+https://github.com/tesseract-ocr/tesseract
+
+O idioma eng.traineddata acompanha o pacote Windows oficial. O modelo ingles
+do projeto Tesseract e distribuido sob Apache License 2.0; a copia integral
+da licenca esta em LICENSE-eng.txt. A licenca do Tesseract esta em
+LICENSE-Tesseract.txt. Os fontes e avisos das bibliotecas de terceiros
+incluidas nas DLLs estao nos respectivos projetos de origem:
+
+Leptonica: https://github.com/DanBloomberg/leptonica
+MSYS2/MinGW-w64 runtime e bibliotecas:
+https://github.com/msys2/MINGW-packages
+
+As DLLs redistribuidas sem modificacoes foram obtidas junto ao executavel
+Windows oficial. Os avisos/licencas aplicaveis a cada biblioteca estao nos
+projetos de origem correspondentes:
+
+libarchive-13: https://github.com/libarchive/libarchive
+libb2-1: https://github.com/BLAKE2/libb2
+libbz2-1: https://sourceware.org/bzip2/
+libcrypto-3-x64: https://github.com/openssl/openssl
+libdeflate: https://github.com/ebiggers/libdeflate
+libexpat-1: https://github.com/libexpat/libexpat
+libgcc_s_seh, libstdc++-6: https://gcc.gnu.org/
+libgif-7: https://sourceforge.net/projects/giflib/
+libiconv-2: https://savannah.gnu.org/projects/libiconv/
+libjbig-0: https://www.cl.cam.ac.uk/~mgk25/jbigkit/
+libjpeg-8: https://github.com/libjpeg-turbo/libjpeg-turbo
+libleptonica-6: https://github.com/DanBloomberg/leptonica
+libLerc: https://github.com/Esri/lerc
+liblz4: https://github.com/lz4/lz4
+liblzma-5: https://github.com/tukaani-project/xz
+libopenjp2-7: https://github.com/uclouvain/openjpeg
+libpng16-16: https://github.com/pnggroup/libpng
+libsharpyuv-0, libwebp-7, libwebpmux-3: https://chromium.googlesource.com/webm/libwebp
+libtiff-6: https://gitlab.com/libtiff/libtiff
+libwinpthread-1: https://www.mingw-w64.org/
+libzstd: https://github.com/facebook/zstd
+zlib1: https://github.com/madler/zlib
+
+O executavel x64 nao requer DLLs do Microsoft Visual C++ Runtime. As DLLs
+nao pertencentes ao Windows exigidas pelo executavel foram incluidas ao lado
+dele para execucao sem PATH ou instalacoes adicionais.
+
+Para recriar este pacote, use somente o instalador x64 acima e preserve os
+avisos/licencas das bibliotecas que fornecerem as DLLs. A aplicacao nao
+instala componentes nem altera as protecoes do Windows.

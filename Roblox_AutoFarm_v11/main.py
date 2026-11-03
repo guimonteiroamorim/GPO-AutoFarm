@@ -62,7 +62,28 @@ DEFAULT = {
     'candies_roi': [580, 535, 790, 610],
     'clock_roi': [1322, 648, 1365, 661],
     'roi_coordinate_space': 'roblox_client_v2',
+    'rare_chests': 0,
 }
+RARE_CHEST_LIMIT = 10
+
+
+def validate_rare_chests(value):
+    if (not isinstance(value, int) or isinstance(value, bool) or
+            not 0 <= value <= RARE_CHEST_LIMIT):
+        raise ValueError(f'Rare Chests deve ser um número inteiro entre 0 e {RARE_CHEST_LIMIT}.')
+    return value
+
+
+def rare_chests_display(value):
+    value = validate_rare_chests(value)
+    if value == RARE_CHEST_LIMIT:
+        return (
+            f'{value}/{RARE_CHEST_LIMIT} — Limite atingido. Compras suspensas; '
+            'coleta e análise continuam.'
+        )
+    return f'{value}/{RARE_CHEST_LIMIT}'
+
+
 # Coordenadas relativas APENAS à área interna do jogo Roblox, sem bordas do Windows.
 # Ajustadas com capturas de 1365x700 e 1366x697 (janela 1366x768).
 ROIS = {'candies': (580,535,790,610), 'clock': (1322,648,1365,661)}
@@ -97,6 +118,7 @@ def load():
             data.update(json.loads(CFG.read_text(encoding='utf-8')))
         except Exception:
             pass
+    data['rare_chests'] = validate_rare_chests(data['rare_chests'])
     # As ROIs antigas eram relativas à TELA COMPLETA e não à área do jogo.
     # Não reaproveitá-las, pois podem incluir a barra de título/tarefas do Windows.
     if data.get('roi_coordinate_space') != 'roblox_client_v2':
@@ -1513,8 +1535,26 @@ def save_clock_diagnostic(shot, cfg):
     except Exception:
         pass
 
+def packaged_tesseract_paths():
+    roots = [BUNDLE_ROOT, ROOT]
+    if FROZEN:
+        roots.append(Path(sys.executable).resolve().parent)
+    return tuple(
+        root / 'tesseract' / 'tesseract.exe'
+        for root in dict.fromkeys(roots)
+    )
+
+
+def packaged_tesseract():
+    return next(
+        (engine for engine in packaged_tesseract_paths() if engine.is_file()),
+        None,
+    )
+
+
 def locate_tesseract():
     candidates = [
+        packaged_tesseract(),
         shutil.which('tesseract'),
         r'C:\Program Files\Tesseract-OCR\tesseract.exe',
         r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
@@ -1523,36 +1563,100 @@ def locate_tesseract():
     return next((p for p in candidates if p and Path(p).is_file()), None)
 
 
+def locate_tessdata(engine):
+    candidates = [Path(engine).parent / 'tessdata']
+    configured_prefix = os.environ.get('TESSDATA_PREFIX')
+    if configured_prefix:
+        prefix = Path(configured_prefix).expanduser()
+        candidates.extend((prefix, prefix / 'tessdata'))
+    return next(
+        (path for path in dict.fromkeys(candidates)
+         if (path / 'eng.traineddata').is_file()),
+        None,
+    )
+
+
+def verify_tesseract(engine):
+    version = pytesseract.get_tesseract_version()
+    pytesseract.image_to_string(
+        Image.new('RGB', (32, 32), 'white'),
+        lang='eng',
+        config='--psm 7',
+        timeout=OCR_TIMEOUT_SECONDS,
+    )
+    return version
+
+
 def configure_tesseract(cfg):
     with CANDIES_OPERATION_LOCK:
         configured = str(cfg.get('tesseract', '') or '').strip()
+        bundled = packaged_tesseract()
         discovered = locate_tesseract()
         candidates = []
-        if configured and Path(configured).is_file():
-            candidates.append(configured)
-        if discovered and discovered not in candidates:
-            candidates.append(discovered)
+        for engine in (bundled, configured, discovered):
+            if engine and Path(engine).is_file() and engine not in candidates:
+                candidates.append(engine)
+
         if not candidates:
-            pytesseract.pytesseract.tesseract_cmd = 'tesseract'
+            expected = '; '.join(
+                str(path) for path in packaged_tesseract_paths()
+            )
+            configured_note = (
+                f' O caminho salvo em config.json não existe: {configured}.'
+                if configured else ''
+            )
             raise RuntimeError(
-                'Tesseract OCR não encontrado. Instale o Tesseract ou configure o caminho '
-                'do tesseract.exe em config.json.'
+                f'Tesseract OCR não encontrado. O executável portátil é esperado '
+                f'em um destes locais: '
+                f'{expected}.{configured_note} Instale o pacote completo ou configure '
+                'um caminho válido para tesseract.exe.'
             )
 
         errors = []
         for engine in candidates:
-            pytesseract.pytesseract.tesseract_cmd = str(engine)
-            try:
-                version = pytesseract.get_tesseract_version()
-            except (pytesseract.pytesseract.TesseractNotFoundError, OSError, RuntimeError) as exc:
-                errors.append(f'{engine}: {exc}')
+            tessdata = locate_tessdata(engine)
+            if tessdata is None:
+                expected = Path(engine).parent / 'tessdata' / 'eng.traineddata'
+                errors.append(
+                    f'{engine}: arquivo de idioma eng.traineddata não encontrado '
+                    f'(esperado em {expected} ou no TESSDATA_PREFIX configurado)'
+                )
                 continue
+
+            pytesseract.pytesseract.tesseract_cmd = str(engine)
+            os.environ['TESSDATA_PREFIX'] = str(tessdata)
+            try:
+                version = verify_tesseract(engine)
+            except (
+                    pytesseract.pytesseract.TesseractNotFoundError,
+                    OSError,
+                    RuntimeError) as exc:
+                errors.append(f'{engine}: não foi possível executar OCR com eng: {exc}')
+                continue
+
             warning = None
-            if configured and engine != configured:
-                warning = f'O caminho Tesseract salvo não está disponível; usando a instalação encontrada em {engine}.'
+            if configured and str(engine) != configured:
+                if not Path(configured).is_file():
+                    warning = (
+                        f'O caminho Tesseract salvo não está disponível; usando '
+                        f'{engine}.'
+                    )
+                elif bundled and Path(engine) == bundled:
+                    warning = (
+                        f'Usando o Tesseract incluído no aplicativo, com prioridade '
+                        f'sobre o caminho salvo em config.json: {engine}.'
+                    )
+                else:
+                    warning = (
+                        f'O caminho Tesseract salvo não pôde ser usado; usando '
+                        f'{engine}.'
+                    )
             return str(engine), str(version), warning
 
-        raise RuntimeError('Tesseract encontrado, mas não pôde ser executado: ' + '; '.join(errors))
+        raise RuntimeError(
+            'Tesseract encontrado, mas a validação do motor OCR falhou: '
+            + '; '.join(errors)
+        )
 
 
 def boss_status(server_seconds):
@@ -1565,7 +1669,7 @@ def boss_status(server_seconds):
     return False, 35*60-phase
 
 class Controller:
-    def __init__(self, emit, relogio):
+    def __init__(self, emit, relogio, rare_chests=0):
         self.emit = emit
         self.relogio = relogio
         self.stop = threading.Event()
@@ -1573,6 +1677,82 @@ class Controller:
         self.cfg = None
         self._run_lock = threading.Lock()
         self._starting = False
+        self._rare_chests_lock = threading.RLock()
+        self._rare_chests = validate_rare_chests(rare_chests)
+        self._limit_log_emitted = False
+
+    @property
+    def rare_chests(self):
+        with self._rare_chests_lock:
+            return self._rare_chests
+
+    def set_rare_chests(self, value, cfg):
+        value = validate_rare_chests(value)
+        with self._rare_chests_lock:
+            if self.active():
+                raise RuntimeError('Pare a automação antes de editar Rare Chests.')
+            if value == self._rare_chests:
+                return value
+            updated_cfg = dict(cfg)
+            updated_cfg['rare_chests'] = value
+            atomic_write_json(CFG, updated_cfg)
+            self._rare_chests = value
+            if self.cfg is not None:
+                self.cfg['rare_chests'] = value
+            if value < RARE_CHEST_LIMIT:
+                self._limit_log_emitted = False
+            if value == RARE_CHEST_LIMIT:
+                self._notify_rare_chest_limit()
+        return value
+
+    def _notify_rare_chest_limit(self):
+        if self.rare_chests < RARE_CHEST_LIMIT:
+            return
+        self.emit('rare_chests', rare_chests_display(self.rare_chests))
+        if not self._limit_log_emitted:
+            self.emit(
+                'log',
+                'Limite de 10 Rare Chests contabilizados atingido. Compras suspensas; '
+                'coleta e análise continuam. O recebimento dos itens no jogo não é '
+                'confirmado automaticamente.',
+            )
+            self._limit_log_emitted = True
+
+    def _record_completed_purchase(self):
+        with self._rare_chests_lock:
+            if self._rare_chests >= RARE_CHEST_LIMIT:
+                self._notify_rare_chest_limit()
+                return self._rare_chests
+            self._rare_chests += 1
+            count = self._rare_chests
+            self.cfg['rare_chests'] = count
+            self.emit('rare_chests', rare_chests_display(count))
+            self.emit(
+                'log',
+                f'Gravação de compra concluída integralmente; Rare Chests '
+                f'contabilizados: {count}/{RARE_CHEST_LIMIT}. Aquisição no jogo '
+                'não confirmada.',
+            )
+            try:
+                atomic_write_json(CFG, self.cfg)
+            except OSError as exc:
+                raise OSError(
+                    f'A gravação de compra terminou e o contador foi atualizado para '
+                    f'{count}/{RARE_CHEST_LIMIT}, mas não foi possível persistir '
+                    f'config.json: {exc}'
+                ) from exc
+            if count == RARE_CHEST_LIMIT:
+                self._notify_rare_chest_limit()
+            return count
+
+    def run_purchase(self):
+        if self.rare_chests >= RARE_CHEST_LIMIT:
+            self._notify_rare_chest_limit()
+            return False
+        if self.run_macro('compra') is not True:
+            return False
+        self._record_completed_purchase()
+        return True
 
     def active(self):
         return self._starting or bool(self.thread and self.thread.is_alive())
@@ -1591,6 +1771,12 @@ class Controller:
                     raise FileNotFoundError(f'Não encontrei {rec.name}. Selecione a gravação .rec no aplicativo.')
                 read_rec(rec)
             self.cfg = cfg.copy()
+            with self._rare_chests_lock:
+                self._rare_chests = validate_rare_chests(
+                    self.cfg.get('rare_chests', DEFAULT['rare_chests'])
+                )
+                self.cfg['rare_chests'] = self._rare_chests
+                self._limit_log_emitted = False
             engine, version, warning = configure_tesseract(cfg)
             if warning:
                 self.emit('log', warning)
@@ -1631,6 +1817,9 @@ class Controller:
         O OCR usa outra thread: uma chamada lenta ao Tesseract NUNCA adia
         os eventos de teclado/mouse do arquivo .rec.
         """
+        if key == 'compra' and self.rare_chests >= RARE_CHEST_LIMIT:
+            self._notify_rare_chest_limit()
+            return False
         rec = macro_recording(self.cfg[key])
         events = read_rec(rec)
         label = {'coleta':'Coletando', 'analise':'Analisando Candies', 'compra':'Comprando'}[key]
@@ -1859,6 +2048,7 @@ class Controller:
     def loop(self):
         try:
             self.emit('log','Automação iniciada. Acompanhe o log e teste com segurança.')
+            self._notify_rare_chest_limit()
             while not self.stop.is_set():
                 self.emit('candies_reset', '— / 250 (aguardando nova análise)')
                 if not self.run_macro('coleta'):
@@ -1868,6 +2058,9 @@ class Controller:
                 veredito = self.run_macro('analise', inspect=True)
                 if self.stop.is_set():
                     break
+                if self.rare_chests >= RARE_CHEST_LIMIT:
+                    self._notify_rare_chest_limit()
+                    continue
                 if veredito is None:
                     self.emit('log', 'Análise não concluída: compra bloqueada; repetindo coleta.')
                     continue
@@ -1914,8 +2107,13 @@ class Controller:
                 if not autorizado:
                     self.emit('log',f'Compra não iniciada: {motivo}.')
                     continue
-                if not self.run_macro('compra'):
-                    break
+                if self.rare_chests >= RARE_CHEST_LIMIT:
+                    self._notify_rare_chest_limit()
+                    continue
+                if not self.run_purchase():
+                    if self.stop.is_set():
+                        break
+                    continue
                 self.emit('candies_reset', '— / 250 (precisa de nova análise após compra)')
                 self.emit('log', 'Gravação de compra reproduzida. A compra NO JOGO não foi confirmada: '
                                  'confira os itens e os cliques na primeira execução. '
@@ -1935,12 +2133,22 @@ class App:
         self.data = load()
         self.events = queue.Queue()
         self.relogio = RelogioManual()
-        self.controller = Controller(lambda k,v:self.events.put((k,v)), self.relogio)
+        self.controller = Controller(
+            lambda k,v:self.events.put((k,v)),
+            self.relogio,
+            self.data['rare_chests'],
+        )
         self.fields = {}
         self.hotkey = tk.StringVar(value=self.data['hotkey'].upper())
         self.record_hotkey = tk.StringVar(value=self.data.get('record_hotkey','f8').upper())
         self.status = tk.StringVar(value='Parado')
         self.candies = tk.StringVar(value='—')
+        self.rare_chests = tk.StringVar(
+            value=rare_chests_display(self.data['rare_chests'])
+        )
+        self.rare_chests_input = tk.StringVar(
+            value=str(self.data['rare_chests'])
+        )
         self.boss = tk.StringVar(value='—')
         self.clock_var = tk.StringVar(value='Não sincronizado')
         self.clock_input = tk.StringVar(value='00:00:00')
@@ -1951,6 +2159,7 @@ class App:
         self._hidden_during_run = False
         self._pending_error = None
         self._ocr_test_running = False
+        self._updating_rare_chests_ui = False
         self.recorder = GravadorRec()
         self.recorder.set_record_hotkey(self._record_hotkey_name)
         self.record_stage = None  # None | coleta | analise | compra
@@ -2064,12 +2273,43 @@ class App:
         stats = ttk.LabelFrame(principal, text='Monitoramento', padding=10)
         stats.pack(fill='x')
         for label, var in [('Estado', self.status), ('Candies', self.candies),
+                           ('Rare Chests:', self.rare_chests),
                            ('Tempo do servidor', self.clock_var), ('Boss', self.boss)]:
             line = ttk.Frame(stats)
             line.pack(fill='x', pady=1)
             ttk.Label(line, text=label).pack(side='left')
             ttk.Label(line, textvariable=var,
-                      font=('Segoe UI', 10, 'bold')).pack(side='right')
+                      font=('Segoe UI', 10, 'bold'), wraplength=620,
+                      justify='right').pack(side='right')
+        rare_chests_line = ttk.Frame(stats)
+        rare_chests_line.pack(fill='x', pady=(5, 1))
+        ttk.Label(
+            rare_chests_line,
+            text='Quantidade manual (edite com a automação parada):',
+        ).pack(side='left')
+        validate_rare_chests = self.root.register(
+            self._validate_rare_chests_input
+        )
+        self.rare_chests_spinbox = ttk.Spinbox(
+            rare_chests_line,
+            from_=0,
+            to=RARE_CHEST_LIMIT,
+            width=5,
+            textvariable=self.rare_chests_input,
+            validate='key',
+            validatecommand=(validate_rare_chests, '%P'),
+            command=self._commit_rare_chests,
+        )
+        self.rare_chests_spinbox.pack(side='right')
+        self.rare_chests_input.trace_add(
+            'write', self._on_rare_chests_input_change
+        )
+        self.rare_chests_spinbox.bind(
+            '<Return>', lambda _event: self._commit_rare_chests()
+        )
+        self.rare_chests_spinbox.bind(
+            '<FocusOut>', lambda _event: self._commit_rare_chests()
+        )
 
         actions = ttk.Frame(principal)
         actions.pack(fill='x', pady=(8, 0))
@@ -2672,12 +2912,98 @@ class App:
             self.data[k] = v.get().strip() or DEFAULT[k]
         self.data['hotkey'] = hk
         self.data['record_hotkey'] = rh
+        self.data['rare_chests'] = self.controller.rare_chests
         self._hotkey_name = hk
         self._record_hotkey_name = rh
         self.recorder.set_record_hotkey(rh)
         atomic_write_json(CFG, self.data)
         self.log('Configurações salvas.')
         return True
+
+    def _validate_rare_chests_input(self, proposed):
+        return (
+            proposed == ''
+            or (
+                proposed.isascii()
+                and proposed.isdigit()
+                and int(proposed) <= RARE_CHEST_LIMIT
+            )
+        )
+
+    def _on_rare_chests_input_change(self, *_args):
+        if self._updating_rare_chests_ui:
+            return
+        value = self.rare_chests_input.get()
+        if value and self._validate_rare_chests_input(value):
+            self._commit_rare_chests()
+
+    def _commit_rare_chests(self, show_error=True):
+        value = self.rare_chests_input.get().strip()
+        try:
+            parsed = validate_rare_chests(int(value))
+        except (ValueError, TypeError):
+            if show_error:
+                messagebox.showerror(
+                    'Rare Chests inválido',
+                    f'Informe um número inteiro entre 0 e {RARE_CHEST_LIMIT}.',
+                )
+            parsed = self.controller.rare_chests
+            self._updating_rare_chests_ui = True
+            try:
+                self.rare_chests_input.set(str(parsed))
+            finally:
+                self._updating_rare_chests_ui = False
+            return False
+
+        if (self.controller.active() or self._start_pending or
+                self.record_stage is not None):
+            if show_error:
+                messagebox.showwarning(
+                    'Automação em andamento',
+                    'Pare a automação ou a gravação antes de editar Rare Chests.',
+                )
+            self._updating_rare_chests_ui = True
+            try:
+                self.rare_chests_input.set(str(self.controller.rare_chests))
+            finally:
+                self._updating_rare_chests_ui = False
+            return False
+
+        try:
+            self.controller.set_rare_chests(parsed, self.data)
+        except (OSError, RuntimeError, ValueError) as exc:
+            if show_error:
+                messagebox.showerror(
+                    'Não foi possível salvar Rare Chests', str(exc)
+                )
+            parsed = self.controller.rare_chests
+            self._updating_rare_chests_ui = True
+            try:
+                self.rare_chests_input.set(str(parsed))
+            finally:
+                self._updating_rare_chests_ui = False
+            return False
+
+        self.data['rare_chests'] = parsed
+        self.rare_chests.set(rare_chests_display(parsed))
+        self._updating_rare_chests_ui = True
+        try:
+            self.rare_chests_input.set(str(parsed))
+        finally:
+            self._updating_rare_chests_ui = False
+        return True
+
+    def _refresh_rare_chests_controls(self):
+        if not hasattr(self, 'rare_chests_spinbox'):
+            return
+        disabled = (
+            self.controller.active()
+            or self._start_pending
+            or self.record_stage is not None
+        )
+        self.rare_chests_spinbox.configure(
+            state='disabled' if disabled else 'normal'
+        )
 
     def on_key(self, key):
         name = getattr(key, 'name', None)
@@ -2778,6 +3104,16 @@ class App:
                 elif key=='candies':self.candies.set(value + ' / 250 (provisório)')
                 elif key in ('candies_reset', 'candies_inconclusivos', 'candies_confirmed'):
                     self.candies.set(value)
+                elif key=='rare_chests':
+                    self.rare_chests.set(value)
+                    self.data['rare_chests'] = self.controller.rare_chests
+                    self._updating_rare_chests_ui = True
+                    try:
+                        self.rare_chests_input.set(
+                            str(self.controller.rare_chests)
+                        )
+                    finally:
+                        self._updating_rare_chests_ui = False
                 elif key=='boss':self.boss.set(value)
                 elif key=='clock':self.clock_var.set(value)
                 elif key=='log':self.log(value)
@@ -2797,6 +3133,7 @@ class App:
         except queue.Empty:
             pass
         self._refresh_ocr_test_button()
+        self._refresh_rare_chests_controls()
         self.root.after(100,self.poll)
 
     def refresh_clock(self):

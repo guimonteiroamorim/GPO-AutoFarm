@@ -39,6 +39,15 @@ cinco leituras concordantes em instantes distintos, ausência de contradições,
 leitura recente, boss ausente, relógio manual sincronizado e margem suficiente
 antes do spawn. Os arquivos .rec e sua reprodução não foram alterados.
 
+RARE CHESTS
+-----------
+O Monitoramento mostra de 0/10 a 10/10 gravações de compra concluídas
+integralmente. A quantidade pode ser ajustada manualmente de 0 a 10 somente
+com a automação parada e é salva automaticamente. Ao atingir 10/10, nenhuma
+compra é executada, mas os ciclos completos Coleta -> Análise continuam.
+O contador representa gravações de compra executadas; não confirma que o item
+foi recebido no inventário do Roblox.
+
 GRAVAÇÕES PERSONALIZADAS
 ------------------------
 Gravar agora mantém somente um arquivo pessoal por categoria em
@@ -188,7 +197,8 @@ INSTALAÇÃO (Windows, Python 3.14 já instalado)
 3. Clique duas vezes em ABRIR_AUTOFARM.cmd. A interface Tkinter abre.
    Alternativa no CMD: python main.py
 
-Ainda é necessário ter o Tesseract OCR instalado para ler os Candies.
+O pacote inclui o Tesseract OCR e o idioma eng em tesseract/. Na execução
+direta pelo Python, o aplicativo também usa esse runtime portátil.
 O relógio não depende do Tesseract.
 
 COMO USAR

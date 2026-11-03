@@ -4,7 +4,7 @@ Projeto de estudo em Python (Windows), com interface em Tkinter, gravação/repr
 
 ## Para executar pelo Python
 
-1. Instale Python para Windows e o **Tesseract OCR** (programa externo necessário para ler Candies).
+1. Instale Python para Windows. O runtime x64 do Tesseract OCR e o idioma `eng` estao incluidos na pasta `tesseract/`.
 2. Extraia o projeto e execute `INSTALAR_DEPENDENCIAS.cmd`, ou rode `python -m pip install -r requirements.txt`.
 3. Execute `ABRIR_AUTOFARM.cmd`, ou `python main.py`.
 4. Confira os três arquivos `.rec`, sincronize o tempo mostrado pelo servidor e teste o OCR antes de iniciar. F12 inicia/para; F8 inicia/termina a gravação (valores padrão).
@@ -13,6 +13,10 @@ Projeto de estudo em Python (Windows), com interface em Tkinter, gravação/repr
 Você pode selecionar suas próprias gravações na interface. O `config.json` local não está no GitHub: o aplicativo cria suas configurações na primeira execução. As gravações originais ficam em `gravacoes/`.
 
 O EXE guarda os dados locais em `%LOCALAPPDATA%\GPO_AutoFarm_v11\`. Ao abrir uma versão nova sem configuração existente, ele copia automaticamente o `config.json` da pasta `%LOCALAPPDATA%\RobloxAutoFarm\` da versão anterior.
+
+### Contador de Rare Chests
+
+O Monitoramento mostra quantas gravações de compra terminaram integralmente, de `0/10` a `10/10`. A quantidade pode ser ajustada manualmente com a automação parada e é salva automaticamente no `config.json`. Ao atingir `10/10`, todas as compras são suspensas, mas os ciclos completos de Coleta e Análise continuam. O contador registra gravações executadas, não confirma que o item entrou no inventário do Roblox.
 
 ### Gravações personalizadas e armazenamento
 
@@ -32,21 +36,21 @@ Falhas do Tesseract e da captura são classificadas sem interromper a reproduç�
 
 Implementação relacionada: `main.py` define o ROI, localiza o contador em `locate_candies_counter`, mantém as rotas e validação em `analyze_candies`/`run_tesseract_variants`, publica gravações pessoais validadas em `publish_custom_recording` e limita diagnósticos em `prune_candies_diagnostics`. A validação temporal em `seguranca_candies.avaliar_leituras` não foi alterada. `test_candies_ocr.py` e `test_seguranca_candies.py` cobrem OCR e compra; `test_storage.py` cobre gravações, metadados, persistência, empacotamento e retenção. Execute `python -m unittest discover -s Roblox_AutoFarm_v11 -v` para validar.
 
-O Tesseract é externo ao EXE. O aplicativo localiza instalações comuns do Windows e confirma que o executável responde antes de iniciar; um caminho salvo inválido não impede o uso de outra instalação encontrada.
+O aplicativo prioriza o Tesseract portátil em `tesseract/`, configura o diretório `tessdata` localmente e testa a execução real do idioma `eng` antes de iniciar. Um caminho antigo salvo em `config.json` não impede o uso do Tesseract incluído. Se o runtime portátil estiver ausente, instalações externas válidas ainda podem ser usadas.
 
 ## Criar um EXE menor, sem bibliotecas alheias
 
-No Windows, execute **`COMPILAR_APLICATIVO.cmd`**. Ele cria `.build-venv` (ambiente isolado), instala apenas as três bibliotecas em `requirements.txt` e o PyInstaller, e compila `dist/GPO_AutoFarm_v11/GPO_AutoFarm_v11.exe` em modo `--onedir`. **Não** utiliza as bibliotecas de outros projetos instaladas no seu Python global.
+No Windows, execute **`COMPILAR_APLICATIVO.cmd`**. Ele valida o Tesseract e o idioma `eng` sem depender do PATH, cria `.build-venv` (ambiente isolado), instala apenas as três bibliotecas em `requirements.txt` e o PyInstaller, compila `dist/GPO_AutoFarm_v11/GPO_AutoFarm_v11.exe` em modo `--onedir` e copia o runtime para `dist/GPO_AutoFarm_v11/tesseract/`. **Não** utiliza as bibliotecas de outros projetos instaladas no seu Python global.
 
-Depois, se quiser instalador com termos, abra `AutoFarm_Instalador.iss` no Inno Setup e compile. O instalador aparece em `instalador/` como `GPO_AutoFarm_v11_Setup.exe`. O tamanho instalado corresponde aos arquivos de `dist/GPO_AutoFarm_v11/` **mais** eventuais programas externos instalados separadamente (como Tesseract). Não há tamanho exato prometido antes da compilação no seu Windows.
+Depois, se quiser instalador com termos, abra `AutoFarm_Instalador.iss` no Inno Setup e compile. O instalador aparece em `instalador/` como `GPO_AutoFarm_v11_Setup.exe`. Tanto o instalador Inno Setup quanto um SFX WinRAR devem incluir a pasta `tesseract/` inteira junto ao EXE. O pacote do Tesseract e suas licenças estao em `tesseract/NOTICE.txt`.
 
-**Importante:** o AutoFarm não incorpora automaticamente o executável do Tesseract ao `dist/`; ele deve existir no computador, a menos que você configure sua própria distribuição dele. Um instalador `.exe` sem assinatura digital pode ser bloqueado pelo Smart App Control do Windows mesmo que o projeto seja seu. Não desative a segurança do Windows apenas para executar o app.
+**Importante:** os binários do aplicativo não têm assinatura digital e ainda podem ser bloqueados pelo Smart App Control do Windows. Não desative as proteções do Windows para executar o app.
 
 ## GitHub e tamanho
 
 - `build/`, `dist/`, `instalador/` são produtos da compilação: **não comitar**.
 - `.build-venv/`, `__pycache__/`, `config.json`, `diagnostico/` são dados/arquivos locais: **não comitar**.
-- O ZIP original duplicava executáveis de compilação, instalador e centenas de bibliotecas. GitHub precisa só do código e arquivos-fonte.
+- O runtime Tesseract x64 é uma dependência redistribuída e fica em `tesseract/`; `build/`, `dist/` e `instalador/` continuam sendo produtos locais da compilação.
 - Os testes estão preservados e podem ser executados em Windows com `python -m unittest discover -v`.
 
 Projeto independente, não oficial do Roblox ou TinyTask. Respeite as regras do jogo e suas limitações de automação.
