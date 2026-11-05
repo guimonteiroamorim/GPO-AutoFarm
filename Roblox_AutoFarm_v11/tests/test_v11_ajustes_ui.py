@@ -3,7 +3,7 @@ import ast
 import unittest
 from pathlib import Path
 
-BASE = Path(__file__).resolve().parent
+BASE = Path(__file__).resolve().parents[1]
 
 
 class TestarAjustesUI(unittest.TestCase):
@@ -22,24 +22,34 @@ class TestarAjustesUI(unittest.TestCase):
 
     def test_nome_novo_nos_artefatos_de_distribuicao(self):
         compilador = (BASE / 'COMPILAR_APLICATIVO.cmd').read_text(encoding='utf-8')
-        instalador = (BASE / 'AutoFarm_Instalador.iss').read_text(encoding='utf-8')
+        readme = (BASE / 'README.md').read_text(encoding='utf-8')
         self.assertIn('--name GPO_AutoFarm_v11', compilador)
         self.assertIn(r'dist\GPO_AutoFarm_v11\GPO_AutoFarm_v11.exe', compilador)
-        self.assertIn('OutputBaseFilename=GPO_AutoFarm_v11_Setup', instalador)
-        self.assertIn('GPO_AutoFarm_v11.exe', instalador)
+        self.assertFalse((BASE / 'AutoFarm_Instalador.iss').exists())
+        self.assertFalse((BASE / 'LEIA_PRIMEIRO.txt').exists())
+        self.assertNotIn('Inno Setup', compilador)
+        self.assertNotIn('WinRAR SFX', readme)
 
     def test_tres_campos_readonly(self):
         ui = ast.get_source_segment(self.texto, self.metodo('construct'))
         self.assertIn("ttk.Entry(line, textvariable=self.fields[key], state='readonly')", ui)
-        self.assertIn('command=lambda k=key:self.choose(k)', ui)
-        self.assertIn('command=lambda k=key:self.arm_recording(k)', ui)
-        self.assertIn('command=lambda k=key:self.export_recording(k)', ui)
+        self.assertIn('self.choose(k)', ui)
+        self.assertIn('self.arm_recording(k)', ui)
+        self.assertIn('self.export_recording(k)', ui)
 
-    def test_rolagem_e_monitoramento(self):
+    def test_monitoramento_separado_e_recursos_condicionais(self):
         ui = ast.get_source_segment(self.texto, self.metodo('construct'))
-        self.assertIn("canvas = tk.Canvas(automation_tab", ui)
-        self.assertIn("text='Monitoramento'", ui)
-        self.assertIn('self._on_automation_mousewheel', ui)
+        self.assertIn("tabs.add(monitor_tab, text='  Monitoramento  ')", ui)
+        self.assertIn("ttk.LabelFrame(monitor_tab, text='Estado e métricas'", ui)
+        self.assertIn('self._refresh_resource_visibility()', ui)
+        visibility = ast.get_source_segment(
+            self.texto, self.metodo('_refresh_resource_visibility')
+        )
+        self.assertIn("self.recording_rows['compra'].pack_forget()", visibility)
+        self.assertIn('self.rare_chests_group.pack_forget()', visibility)
+        self.assertIn('self.boss_group.pack_forget()', visibility)
+        self.assertIn("self.root.geometry('870x570')", self.texto)
+        self.assertIn("self.root.minsize(790,500)", self.texto)
 
     def test_botoes_restauracao(self):
         ui = ast.get_source_segment(self.texto, self.metodo('construct'))

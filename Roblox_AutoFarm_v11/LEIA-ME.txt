@@ -250,7 +250,7 @@ DIAGNÓSTICO DE COMPRA ERRADA
   nenhuma verificação puramente visual garante 100% de acerto.
 
 TESTES V9 + V10
-- Rode no CMD: python -m unittest discover -v
+- Rode no CMD: python -m unittest discover -s tests -p "test_*.py" -v
 - 18 testes passaram neste ambiente, incluindo discordância 227/277,
   249/250, leitura antiga e relógio manual.
 - O OCR foi testado também em duas capturas anteriores: 278/500 e sem contador.

@@ -1,7 +1,6 @@
 # Empacotamento e distribuição (não versionar)
 /build/
 /dist/
-/instalador/
 *.spec
 
 # Ambientes, bibliotecas e cache

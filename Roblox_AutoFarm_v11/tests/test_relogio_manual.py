@@ -62,7 +62,7 @@ class TestRelogioManual(unittest.TestCase):
                 self.relogio.sincronizar(valor)
 
     def test_gravacoes_originais_completas(self):
-        base = Path(__file__).parent / 'gravacoes'
+        base = Path(__file__).resolve().parents[1] / 'gravacoes'
         nomes = (
             'gravacao_coleta_1.rec',
             'gravacao_analise_2.rec',

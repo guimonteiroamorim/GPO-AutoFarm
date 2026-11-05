@@ -5,22 +5,25 @@ from pathlib import Path
 from types import SimpleNamespace
 from gravador import GravadorRec, WM_KEYDOWN
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 class TestarInterfaceV11(unittest.TestCase):
-    def test_tres_abas_e_controles_existentes(self):
+    def test_quatro_abas_e_controles_organizados(self):
         source = (ROOT/'main.py').read_text(encoding='utf-8')
         tree = ast.parse(source)
         app = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'App')
         ui = next(n for n in app.body if isinstance(n, ast.FunctionDef) and n.name == 'construct')
         strings = [n.value for n in ast.walk(ui) if isinstance(n, ast.Constant) and isinstance(n.value,str)]
-        for label in ('  Automação  ', '  Configurações  ', '  Logs  ',
+        for label in ('  Automação  ', '  Monitoramento  ',
+                      '  Configurações  ', '  Logs  ',
+                      'Compras automáticas', 'Limite de Rare Chests',
+                      'Controle do Boss', 'Recursos',
                       '● Gravar agora', '⬇', 'Sincronizar agora',
                       '▶ Iniciar', '■ Parar', 'Testar OCR', 'Calibrar Candies',
         'Verificar gravações', 'Abrir diagnóstico'):
             self.assertIn(label, strings)
         self.assertTrue(any('ESSENCIAL' in s and 'sincronize' in s for s in strings))
-        self.assertEqual(sum('tabs.add(' in ast.get_source_segment(source, n) for n in ast.walk(ui) if isinstance(n,ast.Expr)),3)
+        self.assertEqual(sum('tabs.add(' in ast.get_source_segment(source, n) for n in ast.walk(ui) if isinstance(n,ast.Expr)),4)
 
     def test_tecla_gravacao_configuravel_nao_e_gravada(self):
         gravador = GravadorRec()

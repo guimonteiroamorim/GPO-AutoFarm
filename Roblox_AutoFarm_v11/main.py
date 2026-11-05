@@ -63,8 +63,16 @@ DEFAULT = {
     'clock_roi': [1322, 648, 1365, 661],
     'roi_coordinate_space': 'roblox_client_v2',
     'rare_chests': 0,
+    'auto_purchases': True,
+    'rare_chest_limit_enabled': True,
+    'boss_control_enabled': True,
 }
 RARE_CHEST_LIMIT = 10
+RESOURCE_TOGGLE_KEYS = (
+    'auto_purchases',
+    'rare_chest_limit_enabled',
+    'boss_control_enabled',
+)
 
 
 def validate_rare_chests(value):
@@ -82,6 +90,36 @@ def rare_chests_display(value):
             'coleta e análise continuam.'
         )
     return f'{value}/{RARE_CHEST_LIMIT}'
+
+
+def normalize_hotkey_name(name):
+    if not isinstance(name, str):
+        return None
+    value = name.strip().lower()
+    if re.fullmatch(r'f(?:[1-9]|1[0-9]|2[0-4])', value):
+        return value
+    if re.fullmatch(r'[a-z0-9]', value):
+        return value
+    return None
+
+
+def hotkey_name_from_key(key):
+    name = getattr(key, 'name', None)
+    if name:
+        return normalize_hotkey_name(name)
+    char = getattr(key, 'char', None)
+    if isinstance(char, str) and char.isascii() and len(char) == 1:
+        return normalize_hotkey_name(char)
+    return None
+
+
+def validate_clock_input(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9]{2}:[0-9]{2}:[0-9]{2}', value):
+        raise ValueError('Digite o horário completo no formato HH:MM:SS.')
+    hours, minutes, seconds = (int(part) for part in value.split(':'))
+    if minutes >= 60 or seconds >= 60:
+        raise ValueError('Minutos e segundos devem estar entre 00 e 59.')
+    return value
 
 
 # Coordenadas relativas APENAS à área interna do jogo Roblox, sem bordas do Windows.
@@ -119,6 +157,9 @@ def load():
         except Exception:
             pass
     data['rare_chests'] = validate_rare_chests(data['rare_chests'])
+    for key in RESOURCE_TOGGLE_KEYS:
+        if not isinstance(data[key], bool):
+            raise ValueError(f'A configuração {key} deve ser booleana.')
     # As ROIs antigas eram relativas à TELA COMPLETA e não à área do jogo.
     # Não reaproveitá-las, pois podem incluir a barra de título/tarefas do Windows.
     if data.get('roi_coordinate_space') != 'roblox_client_v2':
@@ -143,6 +184,13 @@ def load():
             else:
                 data[key] = DEFAULT[key]
     return data
+
+def normalize_resource_settings(data):
+    normalized = dict(data)
+    if not normalized.get('auto_purchases', True):
+        normalized['rare_chest_limit_enabled'] = False
+        normalized['boss_control_enabled'] = False
+    return normalized
 
 def resolve(path):
     p = Path(path).expanduser()
@@ -1706,6 +1754,8 @@ class Controller:
         return value
 
     def _notify_rare_chest_limit(self):
+        if not self._rare_chest_limit_enabled():
+            return
         if self.rare_chests < RARE_CHEST_LIMIT:
             return
         self.emit('rare_chests', rare_chests_display(self.rare_chests))
@@ -1718,8 +1768,13 @@ class Controller:
             )
             self._limit_log_emitted = True
 
+    def _rare_chest_limit_enabled(self):
+        return (self.cfg or {}).get('rare_chest_limit_enabled', True)
+
     def _record_completed_purchase(self):
         with self._rare_chests_lock:
+            if not self._rare_chest_limit_enabled():
+                return self._rare_chests
             if self._rare_chests >= RARE_CHEST_LIMIT:
                 self._notify_rare_chest_limit()
                 return self._rare_chests
@@ -1746,7 +1801,9 @@ class Controller:
             return count
 
     def run_purchase(self):
-        if self.rare_chests >= RARE_CHEST_LIMIT:
+        if not (self.cfg or {}).get('auto_purchases', True):
+            return False
+        if self._rare_chest_limit_enabled() and self.rare_chests >= RARE_CHEST_LIMIT:
             self._notify_rare_chest_limit()
             return False
         if self.run_macro('compra') is not True:
@@ -1765,22 +1822,35 @@ class Controller:
                 return False
             self._starting = True
         try:
-            for key in ('coleta','analise','compra'):
+            keys = ['coleta', 'analise']
+            if cfg.get('auto_purchases', True):
+                keys.append('compra')
+            for key in keys:
                 rec = macro_recording(cfg[key])
                 if not rec.is_file():
                     raise FileNotFoundError(f'Não encontrei {rec.name}. Selecione a gravação .rec no aplicativo.')
                 read_rec(rec)
             self.cfg = cfg.copy()
+            for key in RESOURCE_TOGGLE_KEYS:
+                self.cfg.setdefault(key, DEFAULT[key])
+            self.cfg = normalize_resource_settings(self.cfg)
             with self._rare_chests_lock:
                 self._rare_chests = validate_rare_chests(
                     self.cfg.get('rare_chests', DEFAULT['rare_chests'])
                 )
                 self.cfg['rare_chests'] = self._rare_chests
                 self._limit_log_emitted = False
-            engine, version, warning = configure_tesseract(cfg)
-            if warning:
-                self.emit('log', warning)
-            self.emit('log', f'Tesseract confirmado: {engine} (versão {version}).')
+            if self.cfg['auto_purchases']:
+                engine, version, warning = configure_tesseract(self.cfg)
+                if warning:
+                    self.emit('log', warning)
+                self.emit('log', f'Tesseract confirmado: {engine} (versão {version}).')
+            else:
+                self.emit(
+                    'log',
+                    'Compras automáticas desativadas; OCR e validações exclusivas '
+                    'de compra não serão executados.',
+                )
             self.stop.clear()
             self.thread = threading.Thread(target=self.loop, daemon=True)
             self.thread.start()
@@ -1817,9 +1887,12 @@ class Controller:
         O OCR usa outra thread: uma chamada lenta ao Tesseract NUNCA adia
         os eventos de teclado/mouse do arquivo .rec.
         """
-        if key == 'compra' and self.rare_chests >= RARE_CHEST_LIMIT:
-            self._notify_rare_chest_limit()
-            return False
+        if key == 'compra':
+            if not (self.cfg or {}).get('auto_purchases', True):
+                return False
+            if self._rare_chest_limit_enabled() and self.rare_chests >= RARE_CHEST_LIMIT:
+                self._notify_rare_chest_limit()
+                return False
         rec = macro_recording(self.cfg[key])
         events = read_rec(rec)
         label = {'coleta':'Coletando', 'analise':'Analisando Candies', 'compra':'Comprando'}[key]
@@ -2048,17 +2121,25 @@ class Controller:
     def loop(self):
         try:
             self.emit('log','Automação iniciada. Acompanhe o log e teste com segurança.')
-            self._notify_rare_chest_limit()
+            if (self.cfg.get('auto_purchases', True)
+                    and self._rare_chest_limit_enabled()):
+                self._notify_rare_chest_limit()
             while not self.stop.is_set():
                 self.emit('candies_reset', '— / 250 (aguardando nova análise)')
                 if not self.run_macro('coleta'):
                     break
                 if self.stop.is_set():
                     break
-                veredito = self.run_macro('analise', inspect=True)
+                veredito = self.run_macro(
+                    'analise',
+                    inspect=self.cfg.get('auto_purchases', True),
+                )
                 if self.stop.is_set():
                     break
-                if self.rare_chests >= RARE_CHEST_LIMIT:
+                if not self.cfg.get('auto_purchases', True):
+                    continue
+                if (self._rare_chest_limit_enabled()
+                        and self.rare_chests >= RARE_CHEST_LIMIT):
                     self._notify_rare_chest_limit()
                     continue
                 if veredito is None:
@@ -2081,33 +2162,35 @@ class Controller:
                     self.emit('log', 'Compra bloqueada pela verificação rigorosa dos Candies: '
                              + veredito.motivo)
                     continue
-                # O horário do servidor NÃO é mais lido por OCR.
-                # O contador manual avança mesmo enquanto os macros executam.
-                safety = (int(self.cfg['duracao_compra_max_segundos'])
-                          + int(self.cfg['margem_compra_segundos']))
-                autorizado, motivo, status = self.relogio.pode_comprar(
-                    candies, meta=int(self.cfg['meta']), margem_segundos=safety)
-                if status.horario:
-                    self.emit('clock', status.horario + ' (manual)')
-                self.emit('boss', {'PRESENTE':'Presente', 'AUSENTE':'Ausente',
-                                   'DESCONHECIDO':'Desconhecido'}[status.estado])
-                if status.estado == 'DESCONHECIDO':
-                    self.emit('log','Relógio manual não sincronizado: compra bloqueada. '
-                                    'Pare com F12, sincronize o horário e reinicie; continuando a coleta.')
-                    continue
-                self.emit('log',f'Relógio manual: {status.horario} (sem OCR). '
-                                 f'Boss {status.estado.lower()}; próximo spawn em '
-                                 f'{status.ate_proximo_spawn:.0f}s.')
-                if not autorizado:
-                    self.emit('log',f'Compra adiada: {motivo}. Voltando à coleta.')
-                    continue
-                # Segunda conferência instantânea e sem OCR, no instante da compra.
-                autorizado, motivo, status = self.relogio.pode_comprar(
-                    candies, meta=int(self.cfg['meta']), margem_segundos=safety)
-                if not autorizado:
-                    self.emit('log',f'Compra não iniciada: {motivo}.')
-                    continue
-                if self.rare_chests >= RARE_CHEST_LIMIT:
+                if self.cfg.get('boss_control_enabled', True):
+                    # O horário do servidor NÃO é mais lido por OCR.
+                    # O contador manual avança mesmo enquanto os macros executam.
+                    safety = (int(self.cfg['duracao_compra_max_segundos'])
+                              + int(self.cfg['margem_compra_segundos']))
+                    autorizado, motivo, status = self.relogio.pode_comprar(
+                        candies, meta=int(self.cfg['meta']), margem_segundos=safety)
+                    if status.horario:
+                        self.emit('clock', status.horario + ' (manual)')
+                    self.emit('boss', {'PRESENTE':'Presente', 'AUSENTE':'Ausente',
+                                       'DESCONHECIDO':'Desconhecido'}[status.estado])
+                    if status.estado == 'DESCONHECIDO':
+                        self.emit('log','Relógio manual não sincronizado: compra bloqueada. '
+                                        'Pare com F12, sincronize o horário e reinicie; continuando a coleta.')
+                        continue
+                    self.emit('log',f'Relógio manual: {status.horario} (sem OCR). '
+                                     f'Boss {status.estado.lower()}; próximo spawn em '
+                                     f'{status.ate_proximo_spawn:.0f}s.')
+                    if not autorizado:
+                        self.emit('log',f'Compra adiada: {motivo}. Voltando à coleta.')
+                        continue
+                    # Segunda conferência instantânea e sem OCR, no instante da compra.
+                    autorizado, motivo, status = self.relogio.pode_comprar(
+                        candies, meta=int(self.cfg['meta']), margem_segundos=safety)
+                    if not autorizado:
+                        self.emit('log',f'Compra não iniciada: {motivo}.')
+                        continue
+                if (self._rare_chest_limit_enabled()
+                        and self.rare_chests >= RARE_CHEST_LIMIT):
                     self._notify_rare_chest_limit()
                     continue
                 if not self.run_purchase():
@@ -2124,13 +2207,313 @@ class Controller:
             self.emit('status','Parado')
             self.emit('stopped',None)
 
+class ClockTimeInput(ttk.Frame):
+   """Three editable clock segments with fixed separators and bounded input."""
+
+   def __init__(self, master, variable):
+       super().__init__(master)
+       self.variable = variable
+       self._units = ['00', '00', '00']
+       self._updating = False
+       self._all_units_selected = False
+       self._typed_digit_count = [0, 0, 0]
+       self._unit_vars = []
+       self.entries = []
+
+       for index in range(3):
+           if index:
+               ttk.Label(self, text=':', font=('Consolas', 11)).pack(
+                   side='left'
+               )
+           unit_var = tk.StringVar(master=self, value=self._units[index])
+           self._unit_vars.append(unit_var)
+           entry = ttk.Entry(
+               self, textvariable=unit_var, width=3, justify='center',
+               font=('Consolas', 11), validate='key',
+           )
+           entry.pack(side='left')
+           entry.configure(validatecommand=(
+               entry.register(lambda proposed, unit=index:
+                              self._validate_unit(unit, proposed)),
+               '%P',
+           ))
+           entry.bind(
+               '<FocusIn>',
+               lambda _event, unit=index: self._select_unit(unit),
+           )
+           entry.bind('<Control-a>', self._select_all_units)
+           entry.bind('<Control-A>', self._select_all_units)
+           entry.bind(
+               '<KeyPress>',
+               lambda event, unit=index: self._on_keypress(unit, event),
+           )
+           entry.bind('<<Paste>>', self._paste)
+           entry.bind('<Control-v>', self._paste)
+           entry.bind('<Control-V>', self._paste)
+           unit_var.trace_add(
+               'write',
+               lambda *_args, unit=index: self._unit_changed(unit),
+           )
+           self.entries.append(entry)
+
+       self.variable.trace_add('write', self._external_value_changed)
+       try:
+           self.set_time(validate_clock_input(self.variable.get()))
+       except ValueError:
+           self._publish_value()
+
+   @staticmethod
+   def _validate_unit(index, proposed):
+       if (len(proposed) > 2 or not proposed.isascii()
+               or (proposed and not proposed.isdigit())):
+           return False
+       return not (
+           index > 0 and len(proposed) == 2 and int(proposed) >= 60
+       )
+
+   def _select_unit(self, index):
+       was_all_selected = self._all_units_selected
+       self._all_units_selected = False
+       self._typed_digit_count[index] = 0
+       if was_all_selected:
+           for other_index, entry in enumerate(self.entries):
+               if other_index != index:
+                   entry.selection_clear()
+       entry = self.entries[index]
+
+       def select():
+           try:
+               if entry.winfo_exists() and self.focus_get() == entry:
+                   entry.selection_range(0, 'end')
+           except tk.TclError:
+               pass
+
+       self.after_idle(select)
+
+   def _select_all_units(self, _event=None):
+       self._all_units_selected = True
+       for entry in self.entries:
+           entry.selection_range(0, 'end')
+       return 'break'
+
+   def _on_keypress(self, index, event):
+       if (self._all_units_selected
+               and event.keysym not in ('BackSpace', 'Delete')):
+           self._all_units_selected = False
+           for other_index, entry in enumerate(self.entries):
+               if other_index != index:
+                   entry.selection_clear()
+       if event.keysym == 'BackSpace':
+           self._delete_at_cursor(index, backward=True)
+           return 'break'
+       if event.keysym == 'Delete':
+           self._delete_at_cursor(index, backward=False)
+           return 'break'
+       if (event.keysym == 'Left' and index > 0
+               and event.widget.index('insert') <= 0):
+           self.entries[index - 1].focus_set()
+           self.entries[index - 1].icursor('end')
+           return 'break'
+       if (event.keysym == 'Right' and index < 2
+               and event.widget.index('insert') >= len(
+                   self._unit_vars[index].get()
+               )):
+           self.entries[index + 1].focus_set()
+           self.entries[index + 1].icursor(0)
+           return 'break'
+       if event.keysym in ('Left', 'Right', 'Home', 'End'):
+           self._typed_digit_count[index] = 2
+           return None
+       if event.char == ':' and index < 2:
+           self.entries[index + 1].focus_set()
+           return 'break'
+       if event.char and event.char.isascii() and event.char.isdigit():
+           self._insert_digit(index, event.char)
+           return 'break'
+       if event.char and event.char.isprintable():
+           self.bell()
+           return 'break'
+       return None
+
+   def _delete_at_cursor(self, index, backward):
+       entry = self.entries[index]
+       if self._all_units_selected:
+           self.set_time('00:00:00')
+           self.entries[0].focus_set()
+           self.entries[0].icursor(0)
+           return
+
+       current = self._unit_vars[index].get()
+       try:
+           start = entry.index('sel.first')
+           end = entry.index('sel.last')
+       except tk.TclError:
+           start = end = entry.index('insert')
+       if start != end:
+           candidate = current[:start] + current[end:]
+           cursor = start
+       elif backward and start > 0:
+           candidate = current[:start - 1] + current[start:]
+           cursor = start - 1
+       elif not backward and start < len(current):
+           candidate = current[:start] + current[start + 1:]
+           cursor = start
+       else:
+           adjacent = index - 1 if backward else index + 1
+           if 0 <= adjacent < len(self.entries):
+               self.entries[adjacent].focus_set()
+               self.entries[adjacent].icursor(
+                   'end' if backward else 0
+               )
+           return
+
+       current = current.ljust(2, '0')[:2]
+       if start != end:
+           candidate = current[:start] + ('0' * (end - start)) + current[end:]
+       else:
+           digit_index = start - 1 if backward else start
+           candidate = (
+               current[:digit_index] + '0' + current[digit_index + 1:]
+           )
+       self._unit_vars[index].set(candidate)
+       self._all_units_selected = False
+       self._typed_digit_count[index] = 0
+       entry.selection_clear()
+       entry.icursor(cursor)
+
+   @staticmethod
+   def parse_paste(pasted):
+       pasted = pasted.strip()
+       if re.fullmatch(r'[0-9]{2}:[0-9]{2}:[0-9]{2}', pasted):
+           value = pasted
+       elif re.fullmatch(r'[0-9]{6}', pasted):
+           value = f'{pasted[:2]}:{pasted[2:4]}:{pasted[4:]}'
+       else:
+           raise ValueError('Cole um horário no formato HH:MM:SS ou HHMMSS.')
+       return validate_clock_input(value)
+
+   def _insert_digit(self, index, digit):
+       entry = self.entries[index]
+       current = self._unit_vars[index].get()
+       try:
+           selection_start = entry.index('sel.first')
+           selection_end = entry.index('sel.last')
+       except tk.TclError:
+           selection_start = selection_end = entry.index('insert')
+
+       typed_count = self._typed_digit_count[index]
+       has_selection = selection_start != selection_end
+       full_selection = has_selection and selection_start == 0 and selection_end == 2
+       if typed_count == 0 and not (
+               has_selection and not full_selection):
+           candidate = digit + '0'
+           next_typed_count = 1
+           cursor = 1
+       elif (typed_count == 1 and not has_selection
+             and selection_start == 1):
+           candidate = current[0] + digit
+           next_typed_count = 2
+           cursor = 2
+       elif has_selection:
+           candidate = (
+               current[:selection_start] + digit + current[selection_end:]
+           )
+           candidate = candidate.ljust(2, '0')[:2]
+           next_typed_count = 2
+           cursor = min(selection_start + 1, 2)
+       elif index == 2 and selection_start == 2:
+           candidate = current[1] + digit
+           next_typed_count = 2
+           cursor = 2
+       elif selection_start < len(current):
+           candidate = (
+               current[:selection_start] + digit
+               + current[selection_start + 1:]
+           )
+           candidate = candidate.ljust(2, '0')[:2]
+           next_typed_count = 2
+           cursor = min(selection_start + 1, 2)
+       else:
+           candidate = current[:1] + digit
+           next_typed_count = 2
+           cursor = 2
+
+       if not self._validate_unit(index, candidate):
+           self.bell()
+           return
+       self._unit_vars[index].set(candidate)
+       self._typed_digit_count[index] = next_typed_count
+       entry.selection_clear()
+       entry.icursor(cursor)
+       if next_typed_count == 2 and index < 2:
+           self.entries[index + 1].focus_set()
+
+   def _paste(self, _event=None):
+       try:
+           pasted = self.clipboard_get().strip()
+       except tk.TclError:
+           self.bell()
+           return 'break'
+       try:
+           self.set_time(self.parse_paste(pasted))
+       except ValueError:
+           self.bell()
+           return 'break'
+       self.entries[2].focus_set()
+       self._typed_digit_count[2] = 2
+       self.entries[2].icursor('end')
+       return 'break'
+
+   def _unit_changed(self, index):
+       if self._updating:
+           return
+       self._units[index] = self._unit_vars[index].get()
+       self._publish_value()
+
+   def _publish_value(self):
+       self._updating = True
+       try:
+           self.variable.set(':'.join(self._units))
+       finally:
+           self._updating = False
+
+   def _external_value_changed(self, *_args):
+       if self._updating:
+           return
+       try:
+           value = validate_clock_input(self.variable.get())
+       except ValueError:
+           return
+       if self.focus_get() in self.entries:
+           return
+       self.set_time(value)
+
+   def set_time(self, value):
+       value = validate_clock_input(value)
+       self._units = value.split(':')
+       self._all_units_selected = False
+       self._typed_digit_count = [0, 0, 0]
+       self._updating = True
+       try:
+           for variable, unit in zip(self._unit_vars, self._units):
+               variable.set(unit)
+           for entry in self.entries:
+               entry.selection_clear()
+           self.variable.set(value)
+       finally:
+           self._updating = False
+
+
 class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title('GPO_AutoFarm_v11')
-        self.root.geometry('910x643')
-        self.root.minsize(790,520)
-        self.data = load()
+        self.root.geometry('870x570')
+        self.root.minsize(790,500)
+        loaded_data = load()
+        self.data = normalize_resource_settings(loaded_data)
+        if self.data != loaded_data:
+            atomic_write_json(CFG, self.data)
         self.events = queue.Queue()
         self.relogio = RelogioManual()
         self.controller = Controller(
@@ -2152,10 +2535,22 @@ class App:
         self.boss = tk.StringVar(value='—')
         self.clock_var = tk.StringVar(value='Não sincronizado')
         self.clock_input = tk.StringVar(value='00:00:00')
+        self.resource_vars = {
+            key: tk.BooleanVar(value=self.data[key])
+            for key in RESOURCE_TOGGLE_KEYS
+        }
+        self.resource_switches = {}
+        self._resource_controls_disabled = False
         self._hotkey_name = self.data['hotkey'].strip().lower()
         self._record_hotkey_name = self.data.get('record_hotkey','f8').strip().lower()
         self._hotkey_pressed = False
         self._start_pending = False
+        self._hotkey_capture_lock = threading.Lock()
+        self._hotkey_capture_target = None
+        self._hotkey_capture_pending = False
+        self._hotkey_capture_suppressed = set()
+        self._hotkey_capture_dialog = None
+        self._hotkey_capture_status = None
         self._hidden_during_run = False
         self._pending_error = None
         self._ocr_test_running = False
@@ -2189,103 +2584,88 @@ class App:
         threading.Thread(target=cleanup, daemon=True).start()
 
     def construct(self):
-        """Layout em abas. Mantém os mesmos comandos e variáveis da v10."""
+        """Create compact tabs for automation, monitoring, settings and logs."""
         pad = ttk.Frame(self.root, padding=14)
         pad.pack(fill='both', expand=True)
         ttk.Label(pad, text='GPO_AutoFarm_v11',
                   font=('Segoe UI', 17, 'bold')).pack(anchor='w')
-        ttk.Label(pad, text='TinyTask .rec + OCR Candies • relógio sincronizado manualmente').pack(
+        ttk.Label(pad, text='TinyTask .rec + OCR Candies • controle de automação').pack(
             anchor='w', pady=(0, 10))
 
         tabs = ttk.Notebook(pad)
         tabs.pack(fill='both', expand=True)
-        # Área rolável: o monitoramento nunca fica inacessível em janelas menores.
-        automation_tab = ttk.Frame(tabs)
-        canvas = tk.Canvas(automation_tab, highlightthickness=0, borderwidth=0)
-        automation_scroll = ttk.Scrollbar(automation_tab, orient='vertical', command=canvas.yview)
-        def update_automation_scrollbar(first, last):
-            if float(first) <= 0 and float(last) >= 1:
-                automation_scroll.pack_forget()
-            elif not automation_scroll.winfo_manager():
-                automation_scroll.pack(side='right', fill='y')
-
-        canvas.configure(yscrollcommand=update_automation_scrollbar)
-        canvas.pack(side='left', fill='both', expand=True)
-        principal = ttk.Frame(canvas, padding=12)
-        canvas_window = canvas.create_window((0, 0), window=principal, anchor='nw')
-        principal.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.bind('<Configure>', lambda e: canvas.itemconfigure(canvas_window, width=e.width))
-        self.automation_tab = automation_tab
-        self.automation_canvas = canvas
-        self.root.bind_all('<MouseWheel>', self._on_automation_mousewheel, add='+')
+        automation_tab = ttk.Frame(tabs, padding=12)
+        monitor_tab = ttk.Frame(tabs, padding=12)
         configs = ttk.Frame(tabs, padding=16)
         logs = ttk.Frame(tabs, padding=12)
         tabs.add(automation_tab, text='  Automação  ')
+        tabs.add(monitor_tab, text='  Monitoramento  ')
         tabs.add(configs, text='  Configurações  ')
         tabs.add(logs, text='  Logs  ')
         self.tabs = tabs
+        self.automation_tab = automation_tab
+        self.automation_canvas = None
 
-        # ABA AUTOMAÇÃO: gravações, relógio, botões e monitoramento.
-        gravacoes = ttk.LabelFrame(principal, text='Gravações', padding=9)
-        gravacoes.pack(fill='x')
-        for key, label in [('coleta', '1 · Coleta'),
-                           ('analise', '2 · Análise (leitura durante execução)'),
-                           ('compra', '3 · Compra')]:
-            line = ttk.Frame(gravacoes)
+        recordings = ttk.LabelFrame(automation_tab, text='Gravações', padding=9)
+        recordings.pack(fill='x')
+        self.recording_rows = {}
+        for key, label in (
+                ('coleta', '1 · Coleta'),
+                ('analise', '2 · Análise (leitura durante execução)'),
+                ('compra', '3 · Compra')):
+            line = ttk.Frame(recordings)
             line.pack(fill='x', pady=(3, 6))
+            self.recording_rows[key] = line
             ttk.Label(line, text=label, width=32).pack(side='left', padx=(0, 6))
             self.fields[key] = tk.StringVar(value=self.data[key])
             ttk.Entry(line, textvariable=self.fields[key], state='readonly').pack(
                 side='left', fill='x', expand=True)
-            ttk.Button(line, text='Selecionar', command=lambda k=key:self.choose(k)).pack(
+            ttk.Button(line, text='Selecionar',
+                       command=lambda k=key: self.choose(k)).pack(
                 side='left', padx=(7, 0))
             ttk.Button(line, text='● Gravar agora',
-                       command=lambda k=key:self.arm_recording(k)).pack(side='left', padx=(7, 0))
+                       command=lambda k=key: self.arm_recording(k)).pack(
+                side='left', padx=(7, 0))
             ttk.Button(line, text='⬇', width=3,
-                       command=lambda k=key:self.export_recording(k)).pack(side='left', padx=(5, 0))
-        ttk.Button(gravacoes, text='↺ Restaurar padrão',
-                   command=self.restore_automation_defaults).pack(anchor='e', pady=(0, 2))
+                       command=lambda k=key: self.export_recording(k)).pack(
+                side='left', padx=(5, 0))
+        self.restore_automation_button = ttk.Button(
+            recordings, text='↺ Restaurar padrão',
+            command=self.restore_automation_defaults,
+        )
+        self.restore_automation_button.pack(anchor='e', pady=(0, 2))
 
-        manual = ttk.LabelFrame(principal, text='Relógio do servidor — sincronização manual', padding=9)
-        manual.pack(fill='x', pady=(10, 8))
-        ttk.Label(manual,
-                  text='⚠ ESSENCIAL: sincronize o tempo do servidor antes de iniciar. Sem isso, a compra será bloqueada.',
-                  foreground='#a34b00', wraplength=790,
-                  font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(0, 8))
-        mline = ttk.Frame(manual)
-        mline.pack(fill='x')
-        ttk.Label(mline, text='HH:MM:SS').pack(side='left')
-        ttk.Entry(mline, textvariable=self.clock_input, width=13,
-                  font=('Consolas', 11)).pack(side='left', padx=8)
-        ttk.Button(mline, text='Sincronizar agora', command=self.sync_clock).pack(side='left')
-        ttk.Button(mline, text='Invalidar', command=self.invalidate_clock).pack(side='left', padx=(8, 0))
-        ttk.Label(manual,
-                  text='Leia o relógio no Roblox e sincronize imediatamente. Ressincronize ao mudar de servidor.',
-                  wraplength=790).pack(anchor='w', pady=(6, 0))
-
-        btns = ttk.Frame(principal)
-        btns.pack(fill='x', pady=(5, 9))
-        ttk.Button(btns, text='▶ Iniciar', command=self.start).pack(
+        controls = ttk.Frame(automation_tab)
+        controls.pack(fill='x', pady=(9, 0))
+        ttk.Button(controls, text='▶ Iniciar', command=self.start).pack(
             side='left', fill='x', expand=True)
-        ttk.Button(btns, text='■ Parar', command=self.controller.request_stop).pack(
+        ttk.Button(controls, text='■ Parar',
+                   command=self.controller.request_stop).pack(
             side='left', fill='x', expand=True, padx=(9, 0))
 
-        stats = ttk.LabelFrame(principal, text='Monitoramento', padding=10)
+        stats = ttk.LabelFrame(monitor_tab, text='Estado e métricas', padding=9)
         stats.pack(fill='x')
-        for label, var in [('Estado', self.status), ('Candies', self.candies),
-                           ('Rare Chests:', self.rare_chests),
-                           ('Tempo do servidor', self.clock_var), ('Boss', self.boss)]:
+        for label, variable in (('Estado', self.status), ('Candies', self.candies)):
             line = ttk.Frame(stats)
             line.pack(fill='x', pady=1)
             ttk.Label(line, text=label).pack(side='left')
-            ttk.Label(line, textvariable=var,
-                      font=('Segoe UI', 10, 'bold'), wraplength=620,
-                      justify='right').pack(side='right')
-        rare_chests_line = ttk.Frame(stats)
-        rare_chests_line.pack(fill='x', pady=(5, 1))
+            ttk.Label(line, textvariable=variable,
+                      font=('Segoe UI', 10, 'bold'),
+                      wraplength=620, justify='right').pack(side='right')
+
+        self.rare_chests_group = ttk.Frame(stats)
+        self.rare_chests_group.pack(fill='x', pady=(4, 1))
+        rare_line = ttk.Frame(self.rare_chests_group)
+        rare_line.pack(fill='x', pady=1)
+        ttk.Label(rare_line, text='Rare Chests:').pack(side='left')
+        ttk.Label(rare_line, textvariable=self.rare_chests,
+                  font=('Segoe UI', 10, 'bold'), wraplength=620,
+                  justify='right').pack(side='right')
+        rare_chests_line = ttk.Frame(self.rare_chests_group)
+        rare_chests_line.pack(fill='x', pady=(4, 1))
         ttk.Label(
             rare_chests_line,
-            text='Quantidade manual (edite com a automação parada):',
+            text='Quantidade manual de RC (Rare Chest) — edite com a automação parada:',
         ).pack(side='left')
         validate_rare_chests = self.root.register(
             self._validate_rare_chests_input
@@ -2311,43 +2691,144 @@ class App:
             '<FocusOut>', lambda _event: self._commit_rare_chests()
         )
 
-        actions = ttk.Frame(principal)
+        self.boss_group = ttk.LabelFrame(stats, text='Boss', padding=8)
+        self.boss_group.pack(fill='x', pady=(4, 1))
+        for label, variable in (
+                ('Tempo do servidor', self.clock_var),
+                ('Boss', self.boss)):
+            line = ttk.Frame(self.boss_group)
+            line.pack(fill='x', pady=1)
+            ttk.Label(line, text=label).pack(side='left')
+            ttk.Label(line, textvariable=variable,
+                      font=('Segoe UI', 10, 'bold')).pack(side='right')
+
+        manual = ttk.LabelFrame(
+            automation_tab,
+            text='Relógio do servidor — sincronização manual',
+            padding=8,
+        )
+        self.clock_warning = ttk.Label(
+            manual,
+            text='⚠ ESSENCIAL: sincronize o tempo do servidor antes de iniciar. '
+                 'Sem isso, a compra será bloqueada.',
+            foreground='#a34b00', wraplength=790,
+            font=('Segoe UI', 9, 'bold'),
+        )
+        self.clock_warning.pack(anchor='w', pady=(0, 8))
+        mline = ttk.Frame(manual)
+        mline.pack(fill='x')
+        self.clock_input_line = mline
+        ttk.Label(mline, text='HH:MM:SS').pack(side='left')
+        self.clock_time_input = ClockTimeInput(mline, self.clock_input)
+        self.clock_time_input.pack(side='left', padx=8)
+        ttk.Button(mline, text='Sincronizar agora',
+                   command=self.sync_clock).pack(side='left')
+        ttk.Button(mline, text='Invalidar',
+                   command=self.invalidate_clock).pack(side='left', padx=(8, 0))
+        ttk.Label(
+            manual,
+            text='Leia o relógio no Roblox e sincronize imediatamente. '
+                 'Ressincronize ao mudar de servidor.',
+            wraplength=790,
+        ).pack(anchor='w', pady=(6, 0))
+        self.clock_controls = manual
+        manual.pack(fill='x', pady=(9, 0))
+
+        actions = ttk.LabelFrame(monitor_tab, text='Ferramentas', padding=8)
         actions.pack(fill='x', pady=(8, 0))
         self.ocr_test_button = ttk.Button(
             actions, text='Testar OCR', command=self.test_ocr
         )
-        self.ocr_test_button.pack(side='left', fill='x', expand=True)
+        self.ocr_test_button.grid(row=0, column=0, sticky='ew', padx=3, pady=3)
         ttk.Button(actions, text='Calibrar Candies',
-                   command=lambda:self.calibrate('candies')).pack(
-            side='left', fill='x', expand=True, padx=6)
-        ttk.Button(actions, text='Verificar gravações', command=self.inspect_macros).pack(
-            side='left', fill='x', expand=True)
-        ttk.Button(actions, text='Abrir diagnóstico', command=self.open_diagnostics).pack(
-            side='left', fill='x', expand=True, padx=(6, 0))
+                   command=lambda: self.calibrate('candies')).grid(
+            row=0, column=1, sticky='ew', padx=3, pady=3)
+        ttk.Button(actions, text='Verificar gravações',
+                   command=self.inspect_macros).grid(
+            row=1, column=0, sticky='ew', padx=3, pady=3)
+        ttk.Button(actions, text='Abrir diagnóstico',
+                   command=self.open_diagnostics).grid(
+            row=1, column=1, sticky='ew', padx=3, pady=3)
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+        self.monitor_actions = actions
 
-        # ABA CONFIGURAÇÕES: apenas teclas; nenhum outro parâmetro de execução.
         keys = ttk.LabelFrame(configs, text='Atalhos de teclado', padding=16)
+        resources = ttk.LabelFrame(configs, text='Recursos', padding=10)
+        resources.pack(fill='x', pady=(0, 10))
+        resource_labels = {
+            'auto_purchases': 'Compras automáticas',
+            'rare_chest_limit_enabled': 'Limite de Rare Chests',
+            'boss_control_enabled': 'Controle do Boss',
+        }
+        self.resource_rows = {}
+        for key, label_text in resource_labels.items():
+            row = ttk.Frame(resources)
+            row.pack(fill='x', pady=3)
+            ttk.Label(row, text=label_text).pack(side='left', anchor='w')
+            switch = tk.Canvas(
+                row, width=68, height=28, highlightthickness=0,
+                takefocus=True, cursor='hand2',
+            )
+            switch.pack(side='right')
+            switch.bind(
+                '<Button-1>',
+                lambda _event, resource=key: self._toggle_resource_switch(resource),
+            )
+            switch.bind(
+                '<space>',
+                lambda _event, resource=key: self._toggle_resource_switch(resource),
+            )
+            switch.bind(
+                '<Return>',
+                lambda _event, resource=key: self._toggle_resource_switch(resource),
+            )
+            self.resource_rows[key] = row
+            self.resource_switches[key] = switch
         keys.pack(fill='x')
         row_play = ttk.Frame(keys)
         row_play.pack(fill='x', pady=(0, 12))
         ttk.Label(row_play, text='Iniciar / parar automação', width=26).pack(side='left')
-        ttk.Entry(row_play, textvariable=self.hotkey, width=12).pack(side='left')
-        ttk.Label(row_play, text='Padrão: F12').pack(side='left', padx=(12, 0))
+        ttk.Label(
+            row_play, textvariable=self.hotkey, width=8, anchor='center',
+            font=('Segoe UI', 9, 'bold'),
+        ).pack(side='left')
+        self.hotkey_capture_buttons = {}
+        self.hotkey_capture_buttons['hotkey'] = ttk.Button(
+            row_play, text='Definir tecla',
+            command=lambda: self.capture_hotkey('hotkey'),
+        )
+        self.hotkey_capture_buttons['hotkey'].pack(side='left', padx=(6, 0))
+        ttk.Label(row_play, text='Padrão: F12').pack(side='left', padx=(8, 0))
         row_rec = ttk.Frame(keys)
         row_rec.pack(fill='x', pady=(0, 8))
         ttk.Label(row_rec, text='Começar / terminar gravação', width=26).pack(side='left')
-        ttk.Entry(row_rec, textvariable=self.record_hotkey, width=12).pack(side='left')
-        ttk.Label(row_rec, text='Padrão: F8').pack(side='left', padx=(12, 0))
-        ttk.Label(keys,
-                  text='Use teclas F1–F24 diferentes. F12 permanece reservado para cancelar uma gravação.',
-                  wraplength=700).pack(anchor='w', pady=(5, 10))
+        ttk.Label(
+            row_rec, textvariable=self.record_hotkey, width=8, anchor='center',
+            font=('Segoe UI', 9, 'bold'),
+        ).pack(side='left')
+        self.hotkey_capture_buttons['record_hotkey'] = ttk.Button(
+            row_rec, text='Definir tecla',
+            command=lambda: self.capture_hotkey('record_hotkey'),
+        )
+        self.hotkey_capture_buttons['record_hotkey'].pack(
+            side='left', padx=(6, 0)
+        )
+        ttk.Label(row_rec, text='Padrão: F8').pack(side='left', padx=(8, 0))
+        ttk.Label(
+            keys,
+            text='Defina teclas diferentes para cada atalho. F12 continua '
+                 'reservado para cancelar uma gravação.',
+            wraplength=700,
+        ).pack(anchor='w', pady=(5, 10))
         key_actions = ttk.Frame(keys)
         key_actions.pack(anchor='w')
-        ttk.Button(key_actions, text='Salvar configurações', command=self.save).pack(side='left')
+        ttk.Button(key_actions, text='Salvar configurações',
+                   command=self.save).pack(side='left')
         ttk.Button(key_actions, text='↺ Restaurar padrão',
-                   command=self.restore_key_defaults).pack(side='left', padx=(10, 0))
+                   command=self.restore_key_defaults).pack(
+            side='left', padx=(10, 0))
 
-        # ABA LOGS: histórico completo, separado do monitoramento.
         log_frame = ttk.LabelFrame(logs, text='Log de execução', padding=8)
         log_frame.pack(fill='both', expand=True)
         scrollbar = ttk.Scrollbar(log_frame, orient='vertical')
@@ -2357,8 +2838,12 @@ class App:
                               yscrollcommand=scrollbar.set)
         self.logbox.pack(side='left', fill='both', expand=True)
         scrollbar.configure(command=self.logbox.yview)
+        self._refresh_resource_visibility()
+        self._refresh_resource_controls(force=True)
+        self._log_startup_information()
 
-        self.log('v11: interface reorganizada em Automação, Configurações e Logs.')
+    def _log_startup_information(self):
+        self.log('v11: interface organizada em Automação, Monitoramento, Configurações e Logs.')
         self.log('v10: antes de comprar, verificamos foco, área do Roblox e posicionamento do cursor.')
         self.log('v10: o ícone ⬇ ao lado de Gravar agora exporta uma cópia do .rec selecionado.')
         self.log('v9: COMPRA exige leituras recentes e 100% concordantes da análise atual.')
@@ -2367,6 +2852,207 @@ class App:
         self.log(f'{self._hotkey_name.upper()} restaura a interface após parar a automação.')
         self.log('Captura da área interna do Roblox (sem barra de título/tarefas).')
         self.log('Teste o OCR com o item equipado; sincronize o relógio antes de iniciar.')
+
+    def _on_resource_toggle(self, key):
+        requested = self.resource_vars[key].get()
+        previous = self.data[key]
+        if requested == previous:
+            return
+        if (self.controller.active() or self._start_pending
+                or self.record_stage is not None):
+            self.resource_vars[key].set(previous)
+            messagebox.showwarning(
+                'Operação em andamento',
+                'Pare a automação ou a gravação antes de alterar os recursos.',
+            )
+            return
+        if (key in ('rare_chest_limit_enabled', 'boss_control_enabled')
+                and not self.resource_vars['auto_purchases'].get()):
+            self.resource_vars[key].set(False)
+            self._refresh_resource_switch(key)
+            return
+
+        confirmations = {
+            'auto_purchases': (
+                'Desativar Compras automáticas também desligará o Limite de '
+                'Rare Chests e o Controle do Boss. Deseja continuar?'
+            ),
+            'rare_chest_limit_enabled': (
+                'Desativar o Limite de Rare Chests mantém o contador salvo, '
+                'mas ele não bloqueará compras. Continuar?'
+            ),
+            'boss_control_enabled': (
+                'Desativar o Controle do Boss ignora o relógio e a janela do '
+                'boss. Continuar?'
+            ),
+        }
+        if not requested and not messagebox.askyesno(
+                'Desativar recurso', confirmations[key]):
+            self.resource_vars[key].set(previous)
+            self._refresh_resource_switch(key)
+            return
+
+        updated = dict(self.data)
+        updated[key] = requested
+        if key == 'auto_purchases' and not requested:
+            updated['rare_chest_limit_enabled'] = False
+            updated['boss_control_enabled'] = False
+        try:
+            atomic_write_json(CFG, updated)
+        except OSError as exc:
+            self.resource_vars[key].set(previous)
+            if key == 'auto_purchases':
+                self.resource_vars['rare_chest_limit_enabled'].set(
+                    self.data['rare_chest_limit_enabled']
+                )
+            self._refresh_resource_controls(force=True)
+            messagebox.showerror(
+                'Não foi possível salvar o recurso',
+                f'A configuração não foi alterada: {exc}',
+            )
+            return
+
+        boss_control_changed = (
+            self.data.get('boss_control_enabled', True)
+            != updated.get('boss_control_enabled', True)
+        )
+        self.data = updated
+        for resource_key in RESOURCE_TOGGLE_KEYS:
+            self.resource_vars[resource_key].set(updated[resource_key])
+        if boss_control_changed:
+            self.relogio.invalidar()
+            self.clock_var.set('Não sincronizado')
+            self.boss.set('Desconhecido')
+        if self.controller.cfg is not None:
+            self.controller.cfg.update({
+                resource_key: updated[resource_key]
+                for resource_key in RESOURCE_TOGGLE_KEYS
+            })
+        self._refresh_resource_visibility()
+        self._refresh_resource_controls(force=True)
+        self.log(
+            f'{key}: {"ativado" if requested else "desativado"}. '
+            + (
+                'Limite de Rare Chests e Controle do Boss também desativados. '
+                if key == 'auto_purchases' and not requested else ''
+            )
+            + 'Configuração salva.'
+        )
+
+    def _refresh_resource_visibility(self):
+        if not hasattr(self, 'recording_rows'):
+            return
+        purchases = self.resource_vars['auto_purchases'].get()
+        if purchases:
+            if not self.recording_rows['compra'].winfo_manager():
+                self.recording_rows['compra'].pack(
+                    fill='x', pady=(3, 6), before=self.restore_automation_button
+                )
+        else:
+            self.recording_rows['compra'].pack_forget()
+        self.clock_warning.configure(
+            text=(
+                '⚠ ESSENCIAL: sincronize o tempo do servidor antes de iniciar. '
+                'Sem isso, a compra será bloqueada.'
+                if purchases else
+                'Sincronize o relógio para acompanhar o tempo do servidor. '
+                'Compras automáticas estão desativadas.'
+            )
+        )
+
+        if (purchases
+                and self.resource_vars['rare_chest_limit_enabled'].get()):
+            if not self.rare_chests_group.winfo_manager():
+                self.rare_chests_group.pack(fill='x', pady=(4, 1))
+        else:
+            self.rare_chests_group.pack_forget()
+
+        if (purchases
+                and self.resource_vars['boss_control_enabled'].get()):
+            if not self.boss_group.winfo_manager():
+                self.boss_group.pack(fill='x', pady=(4, 1))
+            if not self.clock_controls.winfo_manager():
+                self.clock_controls.pack(fill='x', pady=(9, 0))
+        else:
+            self.boss_group.pack_forget()
+            self.clock_controls.pack_forget()
+
+    def _refresh_resource_switch(self, key):
+        switch = self.resource_switches.get(key)
+        if switch is None:
+            return
+        switch.delete('all')
+        enabled = self.resource_vars[key].get()
+        interaction_enabled = (
+            not self._resource_controls_disabled
+            and (
+                key == 'auto_purchases'
+                or self.resource_vars['auto_purchases'].get()
+            )
+        )
+        track_color = '#829888' if enabled else '#b8bdc2'
+        if not interaction_enabled:
+            track_color = '#d1d4d6'
+        switch.create_rectangle(
+            13, 3, 55, 25, fill=track_color, outline=track_color
+        )
+        switch.create_oval(
+            2, 3, 24, 25, fill=track_color, outline=track_color
+        )
+        switch.create_oval(
+            44, 3, 66, 25, fill=track_color, outline=track_color
+        )
+        if enabled:
+            switch.create_text(
+                23, 14, text='ON', fill='#ffffff',
+                font=('Segoe UI', 7, 'bold'),
+            )
+            knob_x = 54
+        else:
+            switch.create_text(
+                47, 14, text='OFF', fill='#50565a',
+                font=('Segoe UI', 7, 'bold'),
+            )
+            knob_x = 13
+        switch.create_oval(
+            knob_x - 8, 6, knob_x + 8, 22,
+            fill='#ffffff', outline='#ffffff',
+        )
+        switch.configure(
+            cursor='hand2' if interaction_enabled else 'arrow',
+            takefocus=interaction_enabled,
+        )
+
+    def _toggle_resource_switch(self, key):
+        if self._resource_controls_disabled:
+            return
+        if (key == 'rare_chest_limit_enabled'
+                and not self.resource_vars['auto_purchases'].get()):
+            return
+        if (key == 'boss_control_enabled'
+                and not self.resource_vars['auto_purchases'].get()):
+            return
+        self.resource_vars[key].set(not self.resource_vars[key].get())
+        self._on_resource_toggle(key)
+
+    def refresh_resource_widgets(self):
+        self._refresh_resource_visibility()
+        self._refresh_resource_controls(force=True)
+        self.root.update_idletasks()
+
+    def _refresh_resource_controls(self, force=False):
+        if not self.resource_switches:
+            return
+        disabled = (
+            self.controller.active()
+            or self._start_pending
+            or self.record_stage is not None
+        )
+        changed = disabled != self._resource_controls_disabled
+        self._resource_controls_disabled = disabled
+        if force or changed:
+            for key in self.resource_switches:
+                self._refresh_resource_switch(key)
 
     def _on_automation_mousewheel(self, event):
         """Roda do mouse rola apenas o conteúdo da aba Automação."""
@@ -2401,6 +3087,8 @@ class App:
             value = DEFAULT[key]
             self.data[key] = value.copy() if isinstance(value, list) else value
         self.clock_input.set('00:00:00')
+        if hasattr(self, 'clock_time_input'):
+            self.clock_time_input.set_time('00:00:00')
         self.invalidate_clock()
         atomic_write_json(CFG, self.data)
         self.log('Automação restaurada: gravações e calibração padrão; relógio invalidado. '
@@ -2422,7 +3110,8 @@ class App:
             messagebox.showwarning('Automação ativa','Pare a automação antes de sincronizar o relógio.')
             return
         try:
-            horario = self.relogio.sincronizar(self.clock_input.get())
+            horario = validate_clock_input(self.clock_input.get())
+            horario = self.relogio.sincronizar(horario)
             status = self.relogio.status_boss()
         except ValueError as exc:
             messagebox.showerror('Horário inválido',str(exc))
@@ -2440,6 +3129,91 @@ class App:
         self.clock_var.set('Não sincronizado')
         self.boss.set('Desconhecido')
         self.log('Relógio invalidado. Sincronize novamente antes de comprar.')
+
+    def capture_hotkey(self, setting):
+        if self.controller.active() or self._start_pending or self.record_stage is not None:
+            messagebox.showwarning(
+                'Operação em andamento',
+                'Pare a automação ou a gravação antes de alterar os atalhos.',
+            )
+            return
+        if setting not in ('hotkey', 'record_hotkey'):
+            raise ValueError(f'Configuração de atalho inválida: {setting}')
+        if self._hotkey_capture_dialog is not None:
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title('Definir tecla')
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.protocol('WM_DELETE_WINDOW', self._cancel_hotkey_capture)
+        self._hotkey_capture_status = tk.StringVar(
+            master=dialog, value='Pressione a tecla desejada... Esc cancela.'
+        )
+        ttk.Label(
+            dialog, textvariable=self._hotkey_capture_status,
+            padding=(18, 14), justify='center',
+        ).pack()
+        self._hotkey_capture_dialog = dialog
+        dialog.grab_set()
+        self._arm_hotkey_capture(setting)
+
+    def _arm_hotkey_capture(self, setting):
+        with self._hotkey_capture_lock:
+            self._hotkey_capture_target = setting
+            self._hotkey_capture_pending = False
+        self._hotkey_capture_status.set(
+            'Pressione a tecla desejada... Esc cancela.'
+        )
+
+    def _cancel_hotkey_capture(self):
+        with self._hotkey_capture_lock:
+            self._hotkey_capture_target = None
+            self._hotkey_capture_pending = False
+        dialog = self._hotkey_capture_dialog
+        self._hotkey_capture_dialog = None
+        self._hotkey_capture_status = None
+        if dialog is not None:
+            try:
+                dialog.grab_release()
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
+    def _handle_hotkey_capture(self, setting, name):
+        if self._hotkey_capture_dialog is None:
+            return
+        with self._hotkey_capture_lock:
+            self._hotkey_capture_pending = False
+        other = 'record_hotkey' if setting == 'hotkey' else 'hotkey'
+        other_value = getattr(self, other).get().strip().lower()
+        if name == 'f12' and setting == 'record_hotkey':
+            reason = 'F12 é reservada para cancelar gravações; escolha outra tecla.'
+        elif name == other_value:
+            reason = 'Essa tecla já está atribuída ao outro atalho.'
+        else:
+            variable = getattr(self, setting)
+            previous = variable.get()
+            variable.set(name.upper())
+            if self.save():
+                self._cancel_hotkey_capture()
+                return
+            variable.set(previous)
+            reason = 'Não foi possível salvar o atalho. O valor anterior foi mantido.'
+        self._arm_hotkey_capture(setting)
+        self._hotkey_capture_status.set(
+            f'{reason} Pressione outra tecla ou Esc para cancelar.'
+        )
+
+    @staticmethod
+    def _key_fingerprint(key):
+        name = getattr(key, 'name', None)
+        if name:
+            return name.lower()
+        char = getattr(key, 'char', None)
+        if isinstance(char, str):
+            return char.lower()
+        return str(key).lower()
 
     def inspect_macros(self):
         for k in ('coleta','analise','compra'):
@@ -2898,9 +3672,11 @@ class App:
     def save(self):
         hk = self.hotkey.get().strip().lower()
         rh = self.record_hotkey.get().strip().lower()
-        pattern = r'f(?:[1-9]|1[0-9]|2[0-4])'
-        if not re.fullmatch(pattern, hk) or not re.fullmatch(pattern, rh):
-            messagebox.showerror('Tecla inválida', 'Utilize F1 até F24 (ex.: F8 ou F12).')
+        if normalize_hotkey_name(hk) is None or normalize_hotkey_name(rh) is None:
+            messagebox.showerror(
+                'Tecla inválida',
+                'Use uma tecla F1–F24, uma letra de A a Z ou um número de 0 a 9.',
+            )
             return False
         if rh == 'f12':
             messagebox.showerror('Tecla reservada', 'F12 é reservada para cancelar gravações. Escolha outra tecla para gravar.')
@@ -2913,6 +3689,8 @@ class App:
         self.data['hotkey'] = hk
         self.data['record_hotkey'] = rh
         self.data['rare_chests'] = self.controller.rare_chests
+        for key in RESOURCE_TOGGLE_KEYS:
+            self.data[key] = self.resource_vars[key].get()
         self._hotkey_name = hk
         self._record_hotkey_name = rh
         self.recorder.set_record_hotkey(rh)
@@ -3006,10 +3784,39 @@ class App:
         )
 
     def on_key(self, key):
-        name = getattr(key, 'name', None)
-        if not name:
+        name = hotkey_name_from_key(key)
+        fingerprint = self._key_fingerprint(key)
+        with self._hotkey_capture_lock:
+            if fingerprint in self._hotkey_capture_suppressed:
+                return
+            capture_target = self._hotkey_capture_target
+            capture_pending = self._hotkey_capture_pending
+            if capture_target is not None:
+                self._hotkey_capture_suppressed.add(fingerprint)
+                if fingerprint == 'esc':
+                    self._hotkey_capture_target = None
+                    self._hotkey_capture_pending = True
+                    capture_event = ('hotkey_capture_cancel', capture_target)
+                elif name is None:
+                    capture_event = (
+                        'hotkey_capture_invalid',
+                        (capture_target, fingerprint),
+                    )
+                else:
+                    self._hotkey_capture_target = None
+                    self._hotkey_capture_pending = True
+                    capture_event = ('hotkey_captured', (capture_target, name))
+            else:
+                capture_event = None
+        if capture_target is not None:
+            self.events.put(capture_event)
             return
-        name = name.lower()
+        if capture_pending:
+            with self._hotkey_capture_lock:
+                self._hotkey_capture_suppressed.add(fingerprint)
+            return
+        if name is None:
+            return
         if self.record_stage is not None:
             if name == self._record_hotkey_name and not self._record_key_pressed:
                 self._record_key_pressed = True
@@ -3023,10 +3830,12 @@ class App:
             self.events.put(('toggle', None))
 
     def on_release(self, key):
-        name = getattr(key, 'name', None)
-        if not name:
+        fingerprint = self._key_fingerprint(key)
+        with self._hotkey_capture_lock:
+            self._hotkey_capture_suppressed.discard(fingerprint)
+        name = hotkey_name_from_key(key)
+        if name is None:
             return
-        name = name.lower()
         if name == self._record_hotkey_name:
             self._record_key_pressed = False
         if name == self._hotkey_name or name == 'f12':
@@ -3117,6 +3926,25 @@ class App:
                 elif key=='boss':self.boss.set(value)
                 elif key=='clock':self.clock_var.set(value)
                 elif key=='log':self.log(value)
+                elif key=='hotkey_captured':
+                    self._handle_hotkey_capture(*value)
+                elif key=='hotkey_capture_invalid':
+                    setting, fingerprint = value
+                    if self._hotkey_capture_status is not None:
+                        if fingerprint in (
+                                'ctrl', 'ctrl_l', 'ctrl_r', 'shift',
+                                'shift_l', 'shift_r', 'alt', 'alt_l',
+                                'alt_r', 'alt_gr'):
+                            detail = 'Modificadores isolados não são aceitos.'
+                        else:
+                            detail = (
+                                'Tecla não suportada. Use F1–F24, A–Z ou 0–9.'
+                            )
+                        self._hotkey_capture_status.set(
+                            f'{detail} Pressione outra tecla ou Esc para cancelar.'
+                        )
+                elif key=='hotkey_capture_cancel':
+                    self._cancel_hotkey_capture()
                 elif key=='ocr_test_result':
                     self._ocr_test_running = False
                     self._show_ocr_test_result(value)
@@ -3134,10 +3962,14 @@ class App:
             pass
         self._refresh_ocr_test_button()
         self._refresh_rare_chests_controls()
+        self._refresh_resource_controls()
         self.root.after(100,self.poll)
 
     def refresh_clock(self):
         try:
+            if not self.data.get('boss_control_enabled', True):
+                self.root.after(1000, self.refresh_clock)
+                return
             status = self.relogio.status_boss()
             if status.horario is not None:
                 self.clock_var.set(status.horario + ' (manual)')

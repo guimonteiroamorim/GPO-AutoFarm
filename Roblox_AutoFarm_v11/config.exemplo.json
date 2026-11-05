@@ -5,5 +5,8 @@
   "hotkey": "f12",
   "record_hotkey": "f8",
   "meta": 250,
-  "rare_chests": 0
+  "rare_chests": 0,
+  "auto_purchases": true,
+  "rare_chest_limit_enabled": true,
+  "boss_control_enabled": true
 }

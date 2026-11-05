@@ -10,7 +10,7 @@ from gravacao_geometria import carregar_geometria, caminho_metadados
 from recplayer import RECORD, WM_MOUSEMOVE
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def write_recording(path, timestamp=1000):

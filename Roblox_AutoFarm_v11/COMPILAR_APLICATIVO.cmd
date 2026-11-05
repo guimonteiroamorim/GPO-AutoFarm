@@ -56,7 +56,6 @@ if not exist "%~dp0dist\GPO_AutoFarm_v11\tesseract\NOTICE.txt" goto error
 
 echo.
 echo SUCESSO! Abra dist\GPO_AutoFarm_v11\GPO_AutoFarm_v11.exe para testar.
-echo Depois compile AutoFarm_Instalador.iss no Inno Setup.
 echo Tesseract OCR e os dados de idioma estao incluidos na pasta tesseract.
 echo Nao desative a seguranca do Windows para executar o aplicativo.
 pause

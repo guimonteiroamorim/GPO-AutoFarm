@@ -17,7 +17,7 @@ from relogio_manual import RelogioManual
 from seguranca_candies import avaliar_leituras
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 REFERENCE = ROOT / 'referencias' / 'candies.png'
 REGION = tuple(main.ROIS['candies'])
 REFERENCE_ORIGIN = (606, 549, 756, 590)

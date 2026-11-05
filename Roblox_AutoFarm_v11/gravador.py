@@ -48,9 +48,12 @@ class GravadorRec:
         """Altera apenas a tecla de controle da gravação, não o formato .rec."""
         value = str(hotkey).strip().lower()
         import re
-        if not re.fullmatch(r'f(?:[1-9]|1[0-9]|2[0-4])', value):
+        if re.fullmatch(r'f(?:[1-9]|1[0-9]|2[0-4])', value):
+            vk = 0x6F + int(value[1:])
+        elif re.fullmatch(r'[a-z0-9]', value):
+            vk = ord(value.upper())
+        else:
             raise ValueError('Tecla de gravação inválida.')
-        vk = 0x6F + int(value[1:])
         if vk == F12_VK:
             raise ValueError('F12 é reservada para cancelar gravações.')
         with self._lock:

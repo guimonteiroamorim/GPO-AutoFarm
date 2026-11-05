@@ -6,6 +6,8 @@ from unittest.mock import Mock, patch
 import unittest
 import main
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 from gravacao_geometria import (converter_ponto, salvar_geometria,
                                 carregar_geometria, caminho_metadados)
 from recplayer import (
@@ -48,7 +50,7 @@ class TestV10(unittest.TestCase):
             self.assertEqual(carregar_geometria(rec),(0,24,1366,721))
 
     def test_recorded_purchase_click_pairs_and_metadata(self):
-        path = Path(__file__).parent / 'gravacoes' / 'gravacao_compra_3.rec'
+        path = PROJECT_ROOT / 'gravacoes' / 'gravacao_compra_3.rec'
         events = read_rec(path)
         geometry = carregar_geometria(path)
         self.assertIsNotNone(geometry)
@@ -85,7 +87,7 @@ class TestV10(unittest.TestCase):
         self.assertTrue(is_record_stop_key(events, len(events) - 1))
 
     def test_current_purchase_recording_plays_all_events_without_real_input(self):
-        path = Path(__file__).parent / 'gravacoes' / 'gravacao_compra_3.rec'
+        path = PROJECT_ROOT / 'gravacoes' / 'gravacao_compra_3.rec'
         events = read_rec(path)
         expected = [
             event for index, event in enumerate(events)
