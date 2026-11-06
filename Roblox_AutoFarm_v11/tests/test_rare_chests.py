@@ -1,3 +1,4 @@
+import ast
 import json
 import tempfile
 import unittest
@@ -9,6 +10,126 @@ import main
 
 
 class TestRareChests(unittest.TestCase):
+    def test_spinbox_manual_e_somente_leitura_mas_botoes_e_atualizacao_funcionam(self):
+        source = Path(main.__file__).read_text(encoding='utf-8')
+        tree = ast.parse(source)
+        app = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == 'App'
+        )
+        construct = next(
+            node for node in app.body
+            if isinstance(node, ast.FunctionDef) and node.name == 'construct'
+        )
+        spinbox = next(
+            node for node in ast.walk(construct)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'Spinbox'
+        )
+        state = next(
+            (
+                keyword.value.value for keyword in spinbox.keywords
+                if keyword.arg == 'state'
+            ),
+            None,
+        )
+        self.assertEqual(state, 'readonly')
+
+        try:
+            root = main.tk.Tk()
+        except main.tk.TclError as exc:
+            self.skipTest(f'Tk não está disponível: {exc}')
+
+        try:
+            value = main.tk.StringVar(master=root, value='3')
+            spin = main.ttk.Spinbox(
+                root, from_=0, to=10, width=5, textvariable=value,
+                state='readonly',
+            )
+            spin.pack()
+            root.update()
+            app = object.__new__(main.App)
+            app.rare_chests_spinbox = spin
+            app.controller = SimpleNamespace(active=lambda: False)
+            app._start_pending = False
+            app.record_stage = None
+            app._refresh_rare_chests_controls()
+            self.assertEqual(spin.instate(['readonly']), True)
+
+            spin.focus_force()
+            spin.event_generate('<KeyPress>', keysym='9')
+            spin.event_generate('<KeyPress>', keysym='BackSpace')
+            spin.event_generate('<KeyPress>', keysym='Delete')
+            root.clipboard_clear()
+            root.clipboard_append('8')
+            root.update()
+            spin.event_generate('<Control-v>')
+            root.update()
+            self.assertEqual(value.get(), '3')
+
+            up_y = next(
+                y for y in range(spin.winfo_height())
+                if spin.identify(spin.winfo_width() - 4, y)
+                == 'Spinbox.uparrow'
+            )
+            spin.event_generate(
+                '<ButtonPress-1>', x=spin.winfo_width() - 4, y=up_y
+            )
+            spin.event_generate(
+                '<ButtonRelease-1>', x=spin.winfo_width() - 4, y=up_y
+            )
+            root.update()
+            self.assertEqual(value.get(), '4')
+
+            down_y = next(
+                y for y in range(spin.winfo_height())
+                if spin.identify(spin.winfo_width() - 4, y)
+                == 'Spinbox.downarrow'
+            )
+            value.set('7')
+            root.update()
+            self.assertEqual(spin.get(), '7')
+
+            spin.event_generate(
+                '<ButtonPress-1>', x=spin.winfo_width() - 4, y=down_y
+            )
+            spin.event_generate(
+                '<ButtonRelease-1>', x=spin.winfo_width() - 4, y=down_y
+            )
+            root.update()
+            self.assertEqual(value.get(), '6')
+
+            value.set('7')
+            for _ in range(3):
+                spin.event_generate(
+                    '<ButtonPress-1>', x=spin.winfo_width() - 4, y=up_y
+                )
+                spin.event_generate(
+                    '<ButtonRelease-1>', x=spin.winfo_width() - 4, y=up_y
+                )
+                root.update()
+            self.assertEqual(value.get(), '10')
+
+            app.controller = SimpleNamespace(active=lambda: True)
+            app._refresh_rare_chests_controls()
+            self.assertEqual(spin.instate(['disabled']), True)
+            disabled_value = value.get()
+            spin.event_generate(
+                '<ButtonPress-1>', x=spin.winfo_width() - 4, y=up_y
+            )
+            spin.event_generate(
+                '<ButtonRelease-1>', x=spin.winfo_width() - 4, y=up_y
+            )
+            root.update()
+            self.assertEqual(value.get(), disabled_value)
+
+            app.controller = SimpleNamespace(active=lambda: False)
+            app._refresh_rare_chests_controls()
+            self.assertEqual(spin.instate(['readonly']), True)
+        finally:
+            root.destroy()
+
     def test_configuracao_antiga_inicia_zero_e_persiste_apos_reabrir(self):
         with tempfile.TemporaryDirectory() as temp:
             config = Path(temp) / 'config.json'

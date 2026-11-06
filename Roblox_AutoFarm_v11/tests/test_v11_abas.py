@@ -19,9 +19,12 @@ class TestarInterfaceV11(unittest.TestCase):
                       'Compras automáticas', 'Limite de Rare Chests',
                       'Controle do Boss', 'Recursos',
                       '● Gravar agora', '⬇', 'Sincronizar agora',
-                      '▶ Iniciar', '■ Parar', 'Testar OCR', 'Calibrar Candies',
+                      'Testar OCR', 'Calibrar Candies',
         'Verificar gravações', 'Abrir diagnóstico'):
             self.assertIn(label, strings)
+        self.assertNotIn('▶ Iniciar', strings)
+        self.assertNotIn('■ Parar', strings)
+        self.assertIn("self.root.geometry('870x570')", source)
         self.assertTrue(any('ESSENCIAL' in s and 'sincronize' in s for s in strings))
         self.assertEqual(sum('tabs.add(' in ast.get_source_segment(source, n) for n in ast.walk(ui) if isinstance(n,ast.Expr)),4)
 

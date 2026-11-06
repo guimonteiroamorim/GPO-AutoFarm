@@ -487,20 +487,54 @@ class TestHotkeyCapture(unittest.TestCase):
         self.assertIn('já está atribuída', app._hotkey_capture_status.get())
 
     def test_atalho_global_continua_ativo_fora_da_captura(self):
-        app = object.__new__(main.App)
-        app.events = queue.Queue()
-        app._hotkey_capture_lock = threading.Lock()
-        app._hotkey_capture_target = None
-        app._hotkey_capture_pending = False
-        app._hotkey_capture_suppressed = set()
-        app._hotkey_name = 'q'
-        app._record_hotkey_name = 'f8'
-        app._hotkey_pressed = False
-        app._record_key_pressed = False
-        app.record_stage = None
+        for configured, key in (
+                ('q', SimpleNamespace(char='q')),
+                ('f12', SimpleNamespace(name='f12'))):
+            with self.subTest(configured=configured):
+                app = object.__new__(main.App)
+                app.events = queue.Queue()
+                app._hotkey_capture_lock = threading.Lock()
+                app._hotkey_capture_target = None
+                app._hotkey_capture_pending = False
+                app._hotkey_capture_suppressed = set()
+                app._hotkey_name = configured
+                app._record_hotkey_name = 'f8'
+                app._hotkey_pressed = False
+                app._record_key_pressed = False
+                app.record_stage = None
 
-        app.on_key(SimpleNamespace(char='q'))
-        self.assertEqual(app.events.get_nowait(), ('toggle', None))
+                app.on_key(key)
+                self.assertEqual(app.events.get_nowait(), ('toggle', None))
+
+    def test_f12_despacha_inicio_ou_parada_sem_widgets_de_botoes(self):
+        for is_active, expected in ((False, 'start'), (True, 'stop')):
+            with self.subTest(is_active=is_active):
+                actions = []
+                app = object.__new__(main.App)
+                app.events = queue.Queue()
+                app._hotkey_capture_lock = threading.Lock()
+                app._hotkey_capture_target = None
+                app._hotkey_capture_pending = False
+                app._hotkey_capture_suppressed = set()
+                app._hotkey_name = 'f12'
+                app._record_hotkey_name = 'f8'
+                app._hotkey_pressed = False
+                app._record_key_pressed = False
+                app.record_stage = None
+                app._start_pending = False
+                app.controller = SimpleNamespace(
+                    active=lambda: is_active,
+                    request_stop=lambda: actions.append('stop'),
+                )
+                app.start = lambda: actions.append('start')
+                app._refresh_ocr_test_button = lambda: None
+                app._refresh_rare_chests_controls = lambda: None
+                app._refresh_resource_controls = lambda: None
+                app.root = SimpleNamespace(after=lambda *_args: None)
+
+                app.on_key(SimpleNamespace(name='f12'))
+                app.poll()
+                self.assertEqual(actions, [expected])
 
     def test_gravador_exclui_a_tecla_configurada_alfanumerica_do_rec(self):
         recorder = GravadorRec()

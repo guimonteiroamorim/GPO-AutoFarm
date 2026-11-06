@@ -2635,14 +2635,6 @@ class App:
         )
         self.restore_automation_button.pack(anchor='e', pady=(0, 2))
 
-        controls = ttk.Frame(automation_tab)
-        controls.pack(fill='x', pady=(9, 0))
-        ttk.Button(controls, text='▶ Iniciar', command=self.start).pack(
-            side='left', fill='x', expand=True)
-        ttk.Button(controls, text='■ Parar',
-                   command=self.controller.request_stop).pack(
-            side='left', fill='x', expand=True, padx=(9, 0))
-
         stats = ttk.LabelFrame(monitor_tab, text='Estado e métricas', padding=9)
         stats.pack(fill='x')
         for label, variable in (('Estado', self.status), ('Candies', self.candies)):
@@ -2676,6 +2668,7 @@ class App:
             to=RARE_CHEST_LIMIT,
             width=5,
             textvariable=self.rare_chests_input,
+            state='readonly',
             validate='key',
             validatecommand=(validate_rare_chests, '%P'),
             command=self._commit_rare_chests,
@@ -2732,7 +2725,7 @@ class App:
             wraplength=790,
         ).pack(anchor='w', pady=(6, 0))
         self.clock_controls = manual
-        manual.pack(fill='x', pady=(9, 0))
+        manual.pack(fill='x', pady=(4, 0))
 
         actions = ttk.LabelFrame(monitor_tab, text='Ferramentas', padding=8)
         actions.pack(fill='x', pady=(8, 0))
@@ -3780,7 +3773,7 @@ class App:
             or self.record_stage is not None
         )
         self.rare_chests_spinbox.configure(
-            state='disabled' if disabled else 'normal'
+            state='disabled' if disabled else 'readonly'
         )
 
     def on_key(self, key):
